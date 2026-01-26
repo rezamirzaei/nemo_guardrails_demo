@@ -1,0 +1,45 @@
+# NeMo Guardrails Configuration
+# This file defines the LLM model and core settings
+
+models:
+  - type: main
+    engine: google_genai
+    model: gemini-2.0-flash-lite
+    parameters:
+      temperature: 0.7
+      max_output_tokens: 1024
+
+# Instructions for the assistant
+instructions:
+  - type: general
+    content: |
+      You are a helpful, respectful, and knowledgeable AI assistant.
+      You provide accurate information and assist users with their questions.
+      You always maintain a professional and friendly tone.
+      If you don't know something, you admit it rather than making up information.
+      You never provide harmful, illegal, or unethical advice.
+
+# Sample conversation for few-shot learning
+sample_conversation: |
+  user "Hello!"
+    express greeting
+  bot express greeting "Hello! How can I help you today?"
+  user "What can you do?"
+    ask about capabilities
+  bot respond about capabilities "I can help with questions, provide information, and have helpful conversations."
+
+# Rails configuration
+rails:
+  input:
+    flows:
+      - self check input
+      - check jailbreak
+
+  output:
+    flows:
+      - self check output
+      - check facts
+
+# Enable specific features
+enable_multi_step_generation: true
+lowest_temperature: 0.1

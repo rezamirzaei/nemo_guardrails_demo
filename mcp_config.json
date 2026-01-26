@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "nemo-guardrails": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/Users/rezami/PycharmProjects/PythonProject7",
+        "python",
+        "-m",
+        "app.mcp_server"
+      ],
+      "env": {
+        "GOOGLE_API_KEY": "${GOOGLE_API_KEY}"
+      }
+    }
+  }
+}

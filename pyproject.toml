@@ -1,0 +1,30 @@
+[project]
+name = "nemo-guardrails-app"
+version = "0.1.0"
+description = "A Docker-based NeMo Guardrails real-world application with MCP support"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "nemoguardrails>=0.10.0",
+    "google-generativeai>=0.4.0",
+    "langchain>=0.1.0",
+    "langchain-google-genai>=0.0.6",
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.26.0",
+    "pydantic>=2.0.0",
+    "aiohttp>=3.9.0",
+    "mcp>=1.0.0",
+    "sse-starlette>=1.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+

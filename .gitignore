@@ -1,0 +1,42 @@
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Docker
+.docker/
+
+# Logs
+*.log
+logs/
+
+# UV
+.uv/
+uv.lock
+
+# OS
+.DS_Store
+Thumbs.db

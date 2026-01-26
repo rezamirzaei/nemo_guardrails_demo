@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  guardrails-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nemo-guardrails-app
+    ports:
+      - "8000:8000"
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - APP_API_KEY=${APP_API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    env_file:
+      - .env
+    volumes:
+      # Mount config for development (hot reload)
+      - ./config:/app/config:ro
+      - ./app:/app/app:ro
+    restart: unless-stopped
+    # Platform for Mac Intel compatibility
+    platform: linux/amd64
+
+  # Optional: Redis for caching (useful for production)
+  redis:
+    image: redis:7-alpine
+    container_name: guardrails-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    platform: linux/amd64
+
+volumes:
+  redis_data:

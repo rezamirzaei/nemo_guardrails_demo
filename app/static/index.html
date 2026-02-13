@@ -22,7 +22,7 @@
         <div class="brand__mark" aria-hidden="true"></div>
         <div class="brand__text">
           <div class="brand__title">NeMo Guardrails</div>
-          <div class="brand__subtitle">Gemini-backed assistant with safety rails</div>
+          <div class="brand__subtitle">Safety-first assistant with adaptive backend routing</div>
         </div>
       </div>
 
@@ -35,6 +35,9 @@
         </span>
         <span class="pill" ng-class="vm.apiKeyRequired ? 'pill--neutral' : 'pill--ok'">
           {{ vm.apiKeyRequired ? 'API Key Required' : 'No API Key' }}
+        </span>
+        <span class="pill" ng-class="vm.backend.mode === 'unavailable' ? 'pill--warn' : 'pill--neutral'">
+          {{ vm.backend.modeDisplay }}
         </span>
       </div>
     </header>
@@ -49,6 +52,13 @@
             <div class="kv__k">Status</div>
             <div class="kv__v" ng-class="vm.connection.ok ? 'text-ok' : 'text-warn'">
               {{ vm.connection.message }}
+            </div>
+            <div class="kv__k">Backend</div>
+            <div class="kv__v">{{ vm.backend.modeDisplay }}</div>
+            <div class="kv__k">Model</div>
+            <div class="kv__v kv__v--mono">
+              <span ng-if="vm.backend.model">{{ vm.backend.model }}</span>
+              <span ng-if="!vm.backend.model" class="text-muted">Not configured</span>
             </div>
           </div>
         </section>
@@ -213,7 +223,7 @@
         <div class="chat__header">
           <div class="chat__title">Chat</div>
           <div class="chat__hint">
-            {{ vm.mode === 'live' ? 'Guardrails + LLM' : 'Mock response (no LLM)' }}
+            {{ vm.mode === 'live' ? ('Live: ' + vm.backend.modeDisplay) : 'Mock response (no LLM)' }}
           </div>
         </div>
 

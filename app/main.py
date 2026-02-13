@@ -8,21 +8,23 @@ A real-world implementation of NeMo Guardrails with:
 - Custom actions for business logic
 - Web UI for interactive testing
 - REST API with API key authentication
-- Google Gemini as the LLM backend
+- Google Gemini primary backend with local Llama fallback
 - MCP (Model Context Protocol) server support
 """
 
 import asyncio
 import os
 import logging
+import re
 import secrets
 from contextlib import asynccontextmanager
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,9 +51,48 @@ CONFIG_DIR = PROJECT_DIR / "config"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, str(default)).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _get_non_placeholder_env(name: str, placeholder_values: set[str] | None = None) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return ""
+    normalized = value.lower()
+    if placeholder_values and normalized in {p.lower() for p in placeholder_values}:
+        return ""
+    return value
+
+
+GOOGLE_API_KEY = _get_non_placeholder_env("GOOGLE_API_KEY", {"your-gemini-api-key-here"})
+GOOGLE_MODEL = os.getenv("GOOGLE_MODEL", "gemini-2.0-flash-lite").strip() or "gemini-2.0-flash-lite"
+LOCAL_LLM_FALLBACK_ENABLED = _get_bool_env("LOCAL_LLM_FALLBACK_ENABLED", True)
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "llama3.1:8b").strip() or "llama3.1:8b"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
+try:
+    LOCAL_LLM_TIMEOUT_SECONDS = float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "120").strip())
+except ValueError:
+    LOCAL_LLM_TIMEOUT_SECONDS = 120.0
+
+LLM_BACKEND_GOOGLE = "google_guardrails"
+LLM_BACKEND_LOCAL = "local_ollama"
+LLM_BACKEND_UNAVAILABLE = "unavailable"
+
+INPUT_REFUSAL_MESSAGE = (
+    "I can't help with requests that try to bypass safety controls. "
+    "Please rephrase your request."
+)
+OUTPUT_REFUSAL_MESSAGE = (
+    "I can't provide that response because it violates safety checks. "
+    "Please ask for a safer alternative."
+)
+
 # API key configuration.
 # Default: require an API key, and generate a random one if not provided.
-API_KEY_ENABLED = os.getenv("API_KEY_REQUIRED", "true").strip().lower() in {"1", "true", "yes", "on"}
+API_KEY_ENABLED = _get_bool_env("API_KEY_REQUIRED", True)
 _raw_api_key = os.getenv("APP_API_KEY", "").strip()
 GENERATED_API_KEY = False
 if API_KEY_ENABLED:
@@ -66,6 +107,8 @@ API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # Global rails instance
 rails: Optional[LLMRails] = None
+llm_backend_mode = LLM_BACKEND_UNAVAILABLE
+llm_backend_model = ""
 
 # In-memory conversation history (best-effort, for UI/demo use).
 _CONVERSATION_LOCK = asyncio.Lock()
@@ -181,6 +224,85 @@ async def _set_conversation_messages(conversation_id: str, messages: list[dict[s
         entry["updated_at"] = now
 
 
+def _is_google_backend_configured() -> bool:
+    return bool(GOOGLE_API_KEY)
+
+
+def _backend_unavailable_detail() -> str:
+    return (
+        "No LLM backend is available. Configure GOOGLE_API_KEY for Gemini, "
+        "or enable LOCAL_LLM_FALLBACK_ENABLED and run Ollama locally."
+    )
+
+
+async def _check_local_llm_reachable() -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+async def _generate_with_ollama(messages: list[dict[str, str]]) -> str:
+    payload: dict[str, Any] = {
+        "model": LOCAL_LLM_MODEL,
+        "messages": messages,
+        "stream": False,
+    }
+    timeout = httpx.Timeout(
+        timeout=LOCAL_LLM_TIMEOUT_SECONDS,
+        connect=min(10.0, LOCAL_LLM_TIMEOUT_SECONDS),
+    )
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+        response.raise_for_status()
+
+    body = response.json()
+    message = body.get("message")
+    content = message.get("content") if isinstance(message, dict) else body.get("response")
+
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Local LLM returned an empty response")
+
+    return content.strip()
+
+
+async def _run_input_safety(message: str) -> tuple[bool, bool, list[str]]:
+    from config.actions import check_jailbreak_attempt, self_check_input
+
+    context = {"user_message": message}
+    is_jailbreak = bool(await check_jailbreak_attempt(context))
+    input_allowed = bool(await self_check_input(context))
+
+    details: list[str] = []
+    if is_jailbreak:
+        details.append("Jailbreak attempt detected")
+    if not input_allowed:
+        details.append("Input contains blocked patterns")
+    if not details:
+        details.append("Message passes basic input checks")
+
+    return (input_allowed and not is_jailbreak), is_jailbreak, details
+
+
+async def _run_output_safety(message: str) -> tuple[bool, list[str]]:
+    from config.actions import check_facts, self_check_output
+
+    output_allowed = bool(await self_check_output({"bot_message": message}))
+    facts_ok = bool(await check_facts({"bot_message": message}))
+
+    details: list[str] = []
+    if not output_allowed:
+        details.append("Output contains blocked phrases")
+    if not facts_ok:
+        details.append("Output contains unverifiable claims")
+    if not details:
+        details.append("Message passes basic output checks")
+
+    return output_allowed and facts_ok, details
+
+
 # =============================================================================
 # Pydantic Models
 # =============================================================================
@@ -223,6 +345,9 @@ class HealthResponse(BaseModel):
     """Response model for health check"""
     status: str
     guardrails_loaded: bool
+    llm_backend_mode: str = LLM_BACKEND_UNAVAILABLE
+    llm_backend_model: str = ""
+    local_fallback_enabled: bool = LOCAL_LLM_FALLBACK_ENABLED
     version: str = "1.0.0"
 
 
@@ -231,6 +356,8 @@ class APIKeyResponse(BaseModel):
     message: str
     api_key_required: bool = True
     header_name: str = "X-API-Key"
+    llm_backend_mode: str = LLM_BACKEND_UNAVAILABLE
+    llm_backend_model: str = ""
 
 
 class SafetyCheckRequest(BaseModel):
@@ -319,11 +446,9 @@ def load_rails() -> LLMRails:
     """Load NeMo Guardrails config from disk, with environment overrides."""
     config = RailsConfig.from_path(str(CONFIG_DIR))
 
-    model_override = os.getenv("GOOGLE_MODEL", "").strip()
-    if model_override:
-        for model in config.models:
-            if getattr(model, "type", None) == "main":
-                model.model = model_override
+    for model in config.models:
+        if getattr(model, "type", None) == "main":
+            model.model = GOOGLE_MODEL
 
     return LLMRails(config)
 
@@ -331,7 +456,7 @@ def load_rails() -> LLMRails:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager - loads guardrails on startup"""
-    global rails
+    global rails, llm_backend_mode, llm_backend_model
 
     logger.info("Loading NeMo Guardrails configuration...")
     if API_KEY_ENABLED:
@@ -343,12 +468,46 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("API Key authentication: DISABLED (no API key required)")
 
-    try:
-        rails = load_rails()
-        logger.info("NeMo Guardrails loaded successfully!")
-    except Exception as e:
-        logger.error(f"Failed to load guardrails: {e}")
-        raise
+    rails = None
+    llm_backend_mode = LLM_BACKEND_UNAVAILABLE
+    llm_backend_model = ""
+
+    if _is_google_backend_configured():
+        try:
+            rails = load_rails()
+            llm_backend_mode = LLM_BACKEND_GOOGLE
+            llm_backend_model = GOOGLE_MODEL
+            logger.info(f"NeMo Guardrails loaded successfully with {GOOGLE_MODEL}.")
+        except Exception as exc:
+            if LOCAL_LLM_FALLBACK_ENABLED:
+                llm_backend_mode = LLM_BACKEND_LOCAL
+                llm_backend_model = LOCAL_LLM_MODEL
+                logger.warning(f"Failed to initialize Gemini/Guardrails backend: {exc}")
+                logger.warning(
+                    f"Falling back to local Ollama backend at {OLLAMA_BASE_URL} "
+                    f"(model={LOCAL_LLM_MODEL})."
+                )
+            else:
+                logger.error(f"Failed to initialize Gemini/Guardrails backend: {exc}")
+                raise
+    elif LOCAL_LLM_FALLBACK_ENABLED:
+        llm_backend_mode = LLM_BACKEND_LOCAL
+        llm_backend_model = LOCAL_LLM_MODEL
+        logger.info(
+            f"GOOGLE_API_KEY is not set; using local Ollama backend at "
+            f"{OLLAMA_BASE_URL} (model={LOCAL_LLM_MODEL})."
+        )
+    else:
+        logger.warning(_backend_unavailable_detail())
+
+    if llm_backend_mode == LLM_BACKEND_LOCAL:
+        if await _check_local_llm_reachable():
+            logger.info("Local Ollama backend is reachable.")
+        else:
+            logger.warning(
+                f"Ollama is not reachable at {OLLAMA_BASE_URL}. "
+                "Chat requests may return 503 until it is available."
+            )
 
     yield
 
@@ -365,14 +524,14 @@ app = FastAPI(
     description="""
 ## NeMo Guardrails REST API
 
-A production-ready NeMo Guardrails application with input/output moderation, powered by **Google Gemini**.
+A production-ready NeMo Guardrails application with input/output moderation.
 
 ### Features
 - 🛡️ **Input Rails**: Content moderation, jailbreak detection
 - 🔒 **Output Rails**: Response validation, fact-checking
 - 🔑 **API Key Authentication**: Secure access to chat endpoints
 - 💬 **Web UI**: Interactive chat interface for testing
-- 🤖 **Google Gemini**: Powered by Gemini (configurable)
+- 🤖 **Dual Backend**: Gemini + Guardrails when configured, local Ollama fallback otherwise
 - 🔌 **MCP Support**: Model Context Protocol server for Claude Desktop integration
 
 ### Authentication
@@ -447,8 +606,11 @@ async def health_check():
     Returns the health status and whether guardrails are loaded.
     """
     return HealthResponse(
-        status="healthy",
-        guardrails_loaded=rails is not None
+        status="healthy" if llm_backend_mode != LLM_BACKEND_UNAVAILABLE else "degraded",
+        guardrails_loaded=rails is not None,
+        llm_backend_mode=llm_backend_mode,
+        llm_backend_model=llm_backend_model,
+        local_fallback_enabled=LOCAL_LLM_FALLBACK_ENABLED,
     )
 
 
@@ -466,7 +628,9 @@ async def api_info():
             else "API key authentication is disabled."
         ),
         api_key_required=API_KEY_ENABLED,
-        header_name="X-API-Key"
+        header_name="X-API-Key",
+        llm_backend_mode=llm_backend_mode,
+        llm_backend_model=llm_backend_model,
     )
 
 
@@ -480,7 +644,15 @@ async def mcp_info():
     repo_dir = str(PROJECT_DIR)
     return {
         "name": "nemo-guardrails-mcp",
-        "description": "NeMo Guardrails MCP Server - AI assistant with safety rails powered by Google Gemini",
+        "description": (
+            "NeMo Guardrails MCP Server - Gemini+Guardrails primary backend "
+            "with local Ollama fallback"
+        ),
+        "active_backend": {
+            "mode": llm_backend_mode,
+            "model": llm_backend_model,
+            "local_fallback_enabled": LOCAL_LLM_FALLBACK_ENABLED,
+        },
         "tools": [
             {
                 "name": "chat_with_guardrails",
@@ -508,7 +680,10 @@ async def mcp_info():
                         "app.mcp_server"
                     ],
                     "env": {
-                        "GOOGLE_API_KEY": "your-gemini-api-key-here"
+                        "GOOGLE_API_KEY": "your-gemini-api-key-here",
+                        "LOCAL_LLM_FALLBACK_ENABLED": "true",
+                        "LOCAL_LLM_MODEL": "llama3.1:8b",
+                        "OLLAMA_BASE_URL": "http://127.0.0.1:11434"
                     }
                 }
             }
@@ -517,7 +692,7 @@ async def mcp_info():
             "1. Copy the 'claude_desktop_config' JSON above",
             "2. Open Claude Desktop settings",
             "3. Go to Developer > MCP Servers",
-            "4. Paste the configuration and replace the GOOGLE_API_KEY with your actual key",
+            "4. Paste the configuration and replace GOOGLE_API_KEY (or keep fallback-only mode)",
             "5. Restart Claude Desktop"
         ]
     }
@@ -548,9 +723,6 @@ async def chat(
 
     Requires API key authentication via `X-API-Key` header.
     """
-    if rails is None:
-        raise HTTPException(status_code=503, detail="Guardrails not initialized")
-
     conversation_id = (request.conversation_id or "").strip() or _new_conversation_id()
     logger.info(f"Processing message (conversation_id={conversation_id}): {request.message[:50]}...")
 
@@ -560,23 +732,40 @@ async def chat(
 
         guardrails_triggered = False
         try:
-            from config.actions import check_jailbreak_attempt, self_check_input
+            input_is_safe, _, input_details = await _run_input_safety(request.message)
+        except Exception as exc:
+            logger.warning(f"Input safety checks unavailable: {exc}")
+            input_is_safe = True
+            input_details = ["Input safety checks unavailable"]
 
-            context = {"user_message": request.message}
-            is_jailbreak = await check_jailbreak_attempt(context)
-            input_allowed = await self_check_input(context)
-            guardrails_triggered = bool(is_jailbreak) or not bool(input_allowed)
-        except Exception as e:
-            logger.debug(f"Input safety checks unavailable: {e}")
+        if not input_is_safe:
+            response_text = INPUT_REFUSAL_MESSAGE
+            guardrails_triggered = True
+            logger.info(
+                f"Input blocked by safety checks (conversation_id={conversation_id}, details={input_details})"
+            )
+        elif llm_backend_mode == LLM_BACKEND_GOOGLE and rails is not None:
+            response = await rails.generate_async(messages=messages)
+            response_text = str(response.get("content", "")).strip()
+        elif llm_backend_mode == LLM_BACKEND_LOCAL:
+            response_text = await _generate_with_ollama(messages)
+        else:
+            raise HTTPException(status_code=503, detail=_backend_unavailable_detail())
 
-        # Generate response through guardrails
-        response = await rails.generate_async(
-            messages=messages
-        )
+        # Run output checks for both primary and fallback generation paths.
+        try:
+            output_is_safe, output_details = await _run_output_safety(response_text)
+        except Exception as exc:
+            logger.warning(f"Output safety checks unavailable: {exc}")
+            output_is_safe, output_details = True, ["Output safety checks unavailable"]
 
-        response_text = response.get("content", "")
+        if not output_is_safe:
+            guardrails_triggered = True
+            logger.info(
+                f"Output blocked by safety checks (conversation_id={conversation_id}, details={output_details})"
+            )
+            response_text = OUTPUT_REFUSAL_MESSAGE
 
-        # Check for guardrail intervention indicators
         refusal_hints = (
             "I cannot",
             "I'm not able to",
@@ -586,7 +775,10 @@ async def chat(
         if any(hint in response_text for hint in refusal_hints):
             guardrails_triggered = True
 
-        logger.info(f"Generated response (guardrails_triggered={guardrails_triggered})")
+        logger.info(
+            f"Generated response (backend={llm_backend_mode}, "
+            f"guardrails_triggered={guardrails_triggered})"
+        )
 
         await _set_conversation_messages(
             conversation_id,
@@ -599,15 +791,31 @@ async def chat(
             guardrails_triggered=guardrails_triggered
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         error_str = str(e)
         logger.error(f"Error generating response: {e}")
 
+        if llm_backend_mode == LLM_BACKEND_LOCAL:
+            if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)):
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Local Llama backend is unavailable. Start Ollama and ensure "
+                        f"model '{LOCAL_LLM_MODEL}' is pulled."
+                    ),
+                )
+            if isinstance(e, httpx.HTTPStatusError):
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Local Llama backend returned HTTP {e.response.status_code}.",
+                )
+
         # Handle rate limit errors gracefully
         if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str:
             # Extract retry time if available
-            import re
-            retry_match = re.search(r'retry in (\d+)', error_str.lower())
+            retry_match = re.search(r"retry in (\d+)", error_str.lower())
             retry_time = retry_match.group(1) if retry_match else "60"
 
             raise HTTPException(

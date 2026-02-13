@@ -12,16 +12,22 @@ if [ ! -f .env ]; then
     echo "Created .env file"
 fi
 
-# Check if GOOGLE_API_KEY is set
-if grep -q "your-gemini-api-key-here" .env 2>/dev/null; then
-    echo ""
-    echo "⚠️  IMPORTANT: You need to set your GOOGLE_API_KEY in .env"
-    echo "   Edit the file: .env"
-    echo "   Get your key from: https://makersuite.google.com/app/apikey"
-    echo ""
+# Check backend configuration
+if grep -Eq "^GOOGLE_API_KEY=(|your-gemini-api-key-here)$" .env 2>/dev/null; then
+    if grep -Eq "^LOCAL_LLM_FALLBACK_ENABLED=(1|true|yes|on)$" .env 2>/dev/null; then
+        echo ""
+        echo "ℹ️  GOOGLE_API_KEY not set. Server will use local Ollama fallback."
+        echo "   Make sure Ollama is running and your LOCAL_LLM_MODEL is available."
+        echo ""
+    else
+        echo ""
+        echo "⚠️  IMPORTANT: Set GOOGLE_API_KEY or enable LOCAL_LLM_FALLBACK_ENABLED=true in .env"
+        echo ""
+        exit 1
+    fi
 fi
 
-echo "Starting NeMo Guardrails + Gemini server..."
+echo "Starting NeMo Guardrails server..."
 echo ""
 echo "📍 Web UI:      http://localhost:8000"
 echo "📚 Swagger UI:  http://localhost:8000/docs"

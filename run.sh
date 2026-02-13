@@ -13,14 +13,18 @@ echo "======================================"
 if [ ! -f .env ]; then
     echo "📝 Creating .env file from template..."
     cp .env.example .env
-    echo "⚠️  Please edit .env and add your GOOGLE_API_KEY before running again."
+    echo "⚠️  Please edit .env and add your GOOGLE_API_KEY, or keep local fallback enabled."
     exit 1
 fi
 
-# Check if GOOGLE_API_KEY is set
-if grep -q "your-gemini-api-key-here" .env; then
-    echo "⚠️  Please edit .env and add your actual GOOGLE_API_KEY"
-    exit 1
+# Check LLM backend configuration
+if grep -Eq "^GOOGLE_API_KEY=(|your-gemini-api-key-here)$" .env; then
+    if grep -Eq "^LOCAL_LLM_FALLBACK_ENABLED=(1|true|yes|on)$" .env; then
+        echo "ℹ️  GOOGLE_API_KEY not set. Using local Ollama fallback."
+    else
+        echo "⚠️  Set GOOGLE_API_KEY or enable LOCAL_LLM_FALLBACK_ENABLED=true in .env"
+        exit 1
+    fi
 fi
 
 # Set platform for Mac Intel

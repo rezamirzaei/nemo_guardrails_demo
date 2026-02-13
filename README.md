@@ -1,6 +1,6 @@
 # NeMo Guardrails Docker Application
 
-A production-ready NeMo Guardrails application with Docker support, designed for real-world AI safety implementations. Powered by **Google Gemini** with **MCP (Model Context Protocol)** support.
+A production-ready NeMo Guardrails application with Docker support, designed for real-world AI safety implementations. Uses **Google Gemini + Guardrails** when configured, with **local Ollama/Llama fallback** when no API key is provided.
 
 ## Features
 
@@ -10,7 +10,7 @@ A production-ready NeMo Guardrails application with Docker support, designed for
 - **💬 Web UI**: AngularJS (MVC-style) chat interface for testing
 - **📚 Swagger/ReDoc**: Full API documentation
 - **🐳 Docker Support**: Easy deployment with Docker Compose
-- **🤖 Google Gemini**: Powered by Gemini (configurable model)
+- **🤖 Dual LLM Backend**: Gemini + Guardrails primary, local Ollama/Llama fallback
 - **🔌 MCP Support**: Model Context Protocol for Claude Desktop integration
 - **💻 Mac Intel Compatible**: Tested on Intel-based Macs (2019+)
 
@@ -46,8 +46,10 @@ A production-ready NeMo Guardrails application with Docker support, designed for
 # Copy environment template (or create .env)
 cp .env.example .env
 
-# Edit .env and add your Google Gemini API key
-# GOOGLE_API_KEY=your-gemini-api-key-here
+# Option A: Set GOOGLE_API_KEY for Gemini + Guardrails mode
+# Option B: Leave GOOGLE_API_KEY unset and use local Ollama fallback
+# For fallback mode, pull a model (example):
+# ollama pull llama3.1:8b
 ```
 
 ### 2. Run the Application
@@ -105,7 +107,7 @@ This application supports MCP for integration with Claude Desktop and other MCP-
 cp mcp_config.json ~/Library/Application\ Support/Claude/claude_desktop_config.json
 ```
 
-2. Update the `GOOGLE_API_KEY` in the config or set it as an environment variable.
+2. Set `GOOGLE_API_KEY` for Gemini mode, or keep fallback-only mode by enabling local Ollama variables.
 
    If the `--directory` path in `mcp_config.json` doesn't match your local checkout, update it (or use `http://localhost:8000/mcp/info` to get a ready-to-paste config with the correct path).
 
@@ -188,8 +190,12 @@ async def custom_check(context: dict) -> bool:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `GOOGLE_API_KEY` | Google Gemini API key | (required) |
+| `GOOGLE_API_KEY` | Google Gemini API key | (optional) |
 | `GOOGLE_MODEL` | Gemini model to use | gemini-2.0-flash-lite |
+| `LOCAL_LLM_FALLBACK_ENABLED` | Enable local Ollama fallback when Gemini is unavailable | true |
+| `LOCAL_LLM_MODEL` | Ollama model name | llama3.1:8b |
+| `OLLAMA_BASE_URL` | Ollama server URL | http://127.0.0.1:11434 |
+| `LOCAL_LLM_TIMEOUT_SECONDS` | Timeout for local LLM calls | 120 |
 | `APP_API_KEY` | API key for REST API auth | (auto-generated if unset) |
 | `API_KEY_REQUIRED` | Require API key auth for `/api/*` | true |
 | `LOG_LEVEL` | Logging level | INFO |
@@ -232,9 +238,10 @@ docker-compose up --build
    - Ensure Docker Desktop is updated
    - Add `platform: linux/amd64` to docker-compose services
 
-2. **Google Gemini API errors**
-   - Verify your API key is valid
+2. **Gemini API errors**
+   - Verify your `GOOGLE_API_KEY` is valid
    - Check API quota and billing
+   - Or use local fallback with Ollama (`LOCAL_LLM_FALLBACK_ENABLED=true`)
 
 3. **Guardrails not loading**
    - Verify config files are in the `config/` directory
@@ -269,4 +276,5 @@ MIT License
 - [NeMo Guardrails Documentation](https://docs.nvidia.com/nemo/guardrails/)
 - [FastAPI Documentation](https://fastapi.tiangolo.com/)
 - [Google Gemini API Reference](https://ai.google.dev/api)
+- [Ollama Documentation](https://ollama.com/)
 - [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)

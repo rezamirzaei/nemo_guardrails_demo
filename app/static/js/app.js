@@ -125,6 +125,7 @@
 
     vm.connection = { ok: false, message: "Connecting..." };
     vm.health = { ok: false, guardrailsLoaded: false };
+    vm.backend = { mode: "unavailable", model: "", modeDisplay: "Unavailable" };
 
     vm.conversationId = null;
     vm.draft = "";
@@ -273,10 +274,18 @@
               guardrailsTriggered: false,
             });
           } else if (status === 503) {
-            vm.connection = { ok: false, message: "Rails not initialized" };
+            vm.connection = { ok: false, message: "Backend unavailable" };
             vm.messages.push({
               role: "assistant",
-              content: "Guardrails are not initialized yet. Try again in a moment.",
+              content: detail,
+              time: new Date(),
+              guardrailsTriggered: false,
+            });
+          } else if (status === 502) {
+            vm.connection = { ok: false, message: "Backend error" };
+            vm.messages.push({
+              role: "assistant",
+              content: detail,
               time: new Date(),
               guardrailsTriggered: false,
             });
@@ -332,6 +341,7 @@
         .then(function (info) {
           vm.apiKeyRequired = !!info.api_key_required;
           vm.headerName = info.header_name || "X-API-Key";
+          applyBackendState(info.llm_backend_mode, info.llm_backend_model);
         })
         .catch(function () {
           vm.apiKeyRequired = true;
@@ -343,15 +353,36 @@
             ok: health.status === "healthy",
             guardrailsLoaded: !!health.guardrails_loaded,
           };
-          vm.connection = {
-            ok: true,
-            message: vm.health.guardrailsLoaded ? "Ready" : "Server up (rails not loaded)",
-          };
+          applyBackendState(health.llm_backend_mode, health.llm_backend_model);
+
+          if (vm.backend.mode === "unavailable") {
+            vm.connection = { ok: false, message: "No LLM backend configured" };
+          } else if (vm.health.guardrailsLoaded) {
+            vm.connection = { ok: true, message: "Ready (guardrails active)" };
+          } else if (vm.backend.mode === "local_ollama") {
+            vm.connection = { ok: true, message: "Ready (local Llama fallback)" };
+          } else {
+            vm.connection = { ok: true, message: "Server up" };
+          }
         })
         .catch(function () {
           vm.health = { ok: false, guardrailsLoaded: false };
           vm.connection = { ok: false, message: "Cannot reach server" };
         });
+    }
+
+    function applyBackendState(mode, model) {
+      var backendMode = (mode || "").toString().toLowerCase();
+      vm.backend.mode = backendMode || "unavailable";
+      vm.backend.model = model || "";
+      vm.backend.modeDisplay = formatBackendMode(vm.backend.mode);
+    }
+
+    function formatBackendMode(mode) {
+      if (mode === "google_guardrails") return "Gemini + Guardrails";
+      if (mode === "local_ollama") return "Local Llama (Ollama)";
+      if (mode === "unavailable") return "No Backend";
+      return "Unknown Backend";
     }
 
     refreshStatus();

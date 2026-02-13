@@ -11,7 +11,10 @@
         "app.mcp_server"
       ],
       "env": {
-        "GOOGLE_API_KEY": "your-gemini-api-key-here"
+        "GOOGLE_API_KEY": "your-gemini-api-key-here",
+        "LOCAL_LLM_FALLBACK_ENABLED": "true",
+        "LOCAL_LLM_MODEL": "llama3.1:8b",
+        "OLLAMA_BASE_URL": "http://127.0.0.1:11434"
       }
     }
   }

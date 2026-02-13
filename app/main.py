@@ -419,18 +419,72 @@ async def _generate_with_runtime_failover(messages: list[dict[str, str]]) -> tup
     raise HTTPException(status_code=503, detail=_backend_unavailable_detail())
 
 
+def _action_result_to_bool(result: Any) -> Optional[bool]:
+    if isinstance(result, bool):
+        return result
+
+    return_value = getattr(result, "return_value", None)
+    if isinstance(return_value, bool):
+        return return_value
+
+    return None
+
+
+async def _run_guardrails_action_bool(action_name: str, context: dict[str, str]) -> Optional[bool]:
+    if rails is None:
+        return None
+
+    runtime = getattr(rails, "runtime", None)
+    if runtime is None:
+        return None
+
+    action_dispatcher = getattr(runtime, "action_dispatcher", None)
+    llm_task_manager = getattr(runtime, "llm_task_manager", None)
+    if action_dispatcher is None or llm_task_manager is None:
+        return None
+
+    llm = getattr(rails, "llm", None)
+    if llm is None:
+        return None
+
+    if not action_dispatcher.has_registered(action_name):
+        return None
+
+    params: dict[str, Any] = {
+        "context": context,
+        "llm_task_manager": llm_task_manager,
+        "llm": llm,
+        "config": rails.config,
+    }
+
+    result, status = await action_dispatcher.execute_action(action_name, params)
+    if status != "success":
+        return None
+
+    return _action_result_to_bool(result)
+
+
 async def _run_input_safety(message: str) -> tuple[bool, bool, list[str]]:
-    from config.actions import check_jailbreak_attempt, self_check_input
+    from config.actions import check_jailbreak_attempt, keyword_input_filter
 
     context = {"user_message": message}
     is_jailbreak = bool(await check_jailbreak_attempt(context))
-    input_allowed = bool(await self_check_input(context))
+    keyword_allowed = bool(await keyword_input_filter(context))
+
+    semantic_allowed = True
+    semantic_result = await _run_guardrails_action_bool("self_check_input", context)
+    if semantic_result is not None:
+        semantic_allowed = bool(semantic_result)
+
+    input_allowed = keyword_allowed and semantic_allowed
 
     details: list[str] = []
     if is_jailbreak:
         details.append("Jailbreak attempt detected")
-    if not input_allowed:
-        details.append("Input contains blocked patterns")
+    if not keyword_allowed:
+        details.append("Input blocked by keyword prefilter")
+    if not semantic_allowed:
+        details.append("Input blocked by NeMo self-check")
     if not details:
         details.append("Message passes basic input checks")
 
@@ -438,14 +492,22 @@ async def _run_input_safety(message: str) -> tuple[bool, bool, list[str]]:
 
 
 async def _run_output_safety(message: str) -> tuple[bool, list[str]]:
-    from config.actions import check_facts, self_check_output
+    from config.actions import check_facts, keyword_output_filter
 
-    output_allowed = bool(await self_check_output({"bot_message": message}))
+    keyword_allowed = bool(await keyword_output_filter({"bot_message": message}))
+    semantic_allowed = True
+    semantic_result = await _run_guardrails_action_bool("self_check_output", {"bot_message": message})
+    if semantic_result is not None:
+        semantic_allowed = bool(semantic_result)
+
+    output_allowed = keyword_allowed and semantic_allowed
     facts_ok = bool(await check_facts({"bot_message": message}))
 
     details: list[str] = []
-    if not output_allowed:
-        details.append("Output contains blocked phrases")
+    if not keyword_allowed:
+        details.append("Output blocked by keyword prefilter")
+    if not semantic_allowed:
+        details.append("Output blocked by NeMo self-check")
     if not facts_ok:
         details.append("Output contains unverifiable claims")
     if not details:
@@ -1067,23 +1129,12 @@ async def check_input_safety(
     api_key: str = Depends(verify_api_key),
 ):
     """Run lightweight input checks without calling the LLM."""
-    from config.actions import check_jailbreak_attempt, self_check_input
-
-    context = {"user_message": request.message}
-    is_jailbreak = bool(await check_jailbreak_attempt(context))
-    input_allowed = bool(await self_check_input(context))
-
-    details: list[str] = []
-    if is_jailbreak:
-        details.append("Jailbreak attempt detected")
-    if not input_allowed:
-        details.append("Input contains blocked patterns")
-    if not details:
-        details.append("Message passes basic input checks")
+    is_safe, is_jailbreak, details = await _run_input_safety(request.message)
+    input_allowed = not any(detail.startswith("Input blocked") for detail in details)
 
     return InputSafetyResponse(
         message=request.message,
-        is_safe=(input_allowed and not is_jailbreak),
+        is_safe=is_safe,
         jailbreak_detected=is_jailbreak,
         input_allowed=input_allowed,
         details=details,
@@ -1101,16 +1152,7 @@ async def check_output_safety(
     api_key: str = Depends(verify_api_key),
 ):
     """Run lightweight output checks without calling the LLM."""
-    from config.actions import self_check_output
-
-    context = {"bot_message": request.message}
-    output_allowed = bool(await self_check_output(context))
-
-    details: list[str] = []
-    if output_allowed:
-        details.append("Message passes basic output checks")
-    else:
-        details.append("Output contains blocked phrases")
+    output_allowed, details = await _run_output_safety(request.message)
 
     return OutputSafetyResponse(
         message=request.message,

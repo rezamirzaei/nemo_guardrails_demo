@@ -32,11 +32,13 @@ sample_conversation: |
 rails:
   input:
     flows:
-      - self check input
+      - keyword input prefilter
       - check jailbreak
+      - self check input
 
   output:
     flows:
+      - keyword output prefilter
       - self check output
       - check facts
 

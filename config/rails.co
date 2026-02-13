@@ -2,6 +2,14 @@
 # INPUT RAILS - Check and moderate user input
 # =============================================================================
 
+define flow keyword input prefilter
+  """Fast deterministic prefilter before semantic checks."""
+  $allowed = execute keyword_input_filter
+
+  if not $allowed
+    bot refuse to respond
+    stop
+
 define flow self check input
   """Check if the user input is appropriate and safe."""
   $allowed = execute self_check_input
@@ -21,6 +29,14 @@ define flow check jailbreak
 # =============================================================================
 # OUTPUT RAILS - Validate bot responses
 # =============================================================================
+
+define flow keyword output prefilter
+  """Fast deterministic prefilter before semantic checks."""
+  $allowed = execute keyword_output_filter
+
+  if not $allowed
+    bot refuse to respond
+    stop
 
 define flow self check output
   """Check if the bot output is appropriate and safe."""

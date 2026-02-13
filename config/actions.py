@@ -6,57 +6,109 @@ They are called from the Colang flows defined in rails.co
 """
 
 import logging
+import re
+from difflib import SequenceMatcher
 from typing import Optional
+
 from nemoguardrails.actions import action
 
 logger = logging.getLogger(__name__)
 
 
-@action(name="self_check_input")
-async def self_check_input(context: Optional[dict] = None) -> bool:
+INPUT_BLOCK_PATTERNS = (
+    "ignore your instructions",
+    "forget your rules",
+    "pretend you have no",
+    "act as if you can",
+    "bypass your",
+)
+
+OUTPUT_BLOCK_PHRASES = (
+    "here's how to hack",
+    "here's how to steal",
+    "bypass security by",
+)
+
+JAILBREAK_INDICATORS = (
+    "dan mode",
+    "do anything now",
+    "ignore all previous",
+    "ignore previous instructions",
+    "disregard your programming",
+    "pretend you are evil",
+    "jailbreak",
+    "bypass your restrictions",
+    "roleplay as an ai without",
+    "act like you have no limits",
+)
+
+JAILBREAK_REGEXES = (
+    r"\bign\w*\s+all\s+prev\w*\b",
+    r"\bignore\b.{0,25}\b(instruction|rule|policy|guideline)s?\b",
+    r"\b(bypass|disable|override)\b.{0,25}\b(safety|guardrail|restriction|policy)\b",
+)
+
+
+def _normalize_message(text: str) -> str:
+    lowered = text.lower()
+    # Keep alnum + whitespace; normalize punctuation/extra spacing.
+    lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
+
+
+def _fuzzy_contains(normalized_message: str, normalized_indicator: str, threshold: float) -> bool:
+    if not normalized_message or not normalized_indicator:
+        return False
+
+    if normalized_indicator in normalized_message:
+        return True
+
+    words = normalized_message.split()
+    indicator_words = normalized_indicator.split()
+    window_size = len(indicator_words)
+    if window_size == 0 or len(words) < window_size:
+        return False
+
+    for idx in range(len(words) - window_size + 1):
+        window = " ".join(words[idx : idx + window_size])
+        if SequenceMatcher(None, window, normalized_indicator).ratio() >= threshold:
+            return True
+
+    return False
+
+
+def _matches_phrase(message: str, phrase: str, threshold: float = 0.87) -> bool:
+    normalized_message = _normalize_message(message)
+    normalized_phrase = _normalize_message(phrase)
+    return _fuzzy_contains(normalized_message, normalized_phrase, threshold)
+
+
+@action(name="keyword_input_filter")
+async def keyword_input_filter(context: Optional[dict] = None) -> bool:
     """
-    Check if user input is appropriate.
+    Fast deterministic prefilter for user input.
     Returns True if input is allowed, False if it should be blocked.
     """
     user_message = context.get("user_message", "") if context else ""
-
-    # Basic keyword-based checks (supplement LLM-based checks)
-    blocked_patterns = [
-        "ignore your instructions",
-        "forget your rules",
-        "pretend you have no",
-        "act as if you can",
-        "bypass your",
-    ]
-
-    message_lower = user_message.lower()
-    for pattern in blocked_patterns:
-        if pattern in message_lower:
-            logger.warning(f"Input blocked due to pattern: {pattern}")
+    for pattern in INPUT_BLOCK_PATTERNS:
+        if _matches_phrase(user_message, pattern):
+            logger.warning(f"Input blocked due to keyword prefilter: {pattern}")
             return False
 
     return True
 
 
-@action(name="self_check_output")
-async def self_check_output(context: Optional[dict] = None) -> bool:
+@action(name="keyword_output_filter")
+async def keyword_output_filter(context: Optional[dict] = None) -> bool:
     """
-    Check if bot output is appropriate.
+    Fast deterministic prefilter for bot output.
     Returns True if output is allowed, False if it should be blocked.
     """
     bot_message = context.get("bot_message", "") if context else ""
-
-    # Basic checks for inappropriate content
-    blocked_phrases = [
-        "here's how to hack",
-        "here's how to steal",
-        "bypass security by",
-    ]
-
-    message_lower = bot_message.lower()
-    for phrase in blocked_phrases:
-        if phrase in message_lower:
-            logger.warning(f"Output blocked due to phrase: {phrase}")
+    for phrase in OUTPUT_BLOCK_PHRASES:
+        if _matches_phrase(bot_message, phrase, threshold=0.9):
+            logger.warning(f"Output blocked due to keyword prefilter: {phrase}")
             return False
 
     return True
@@ -69,23 +121,16 @@ async def check_jailbreak_attempt(context: Optional[dict] = None) -> bool:
     Returns True if a jailbreak is detected, False otherwise.
     """
     user_message = context.get("user_message", "") if context else ""
+    normalized_message = _normalize_message(user_message)
 
-    jailbreak_indicators = [
-        "dan mode",
-        "do anything now",
-        "ignore all previous",
-        "disregard your programming",
-        "pretend you are evil",
-        "jailbreak",
-        "bypass your restrictions",
-        "roleplay as an ai without",
-        "act like you have no limits",
-    ]
+    for regex in JAILBREAK_REGEXES:
+        if re.search(regex, normalized_message):
+            logger.warning(f"Jailbreak attempt detected by regex: {regex}")
+            return True
 
-    message_lower = user_message.lower()
-    for indicator in jailbreak_indicators:
-        if indicator in message_lower:
-            logger.warning(f"Jailbreak attempt detected: {indicator}")
+    for indicator in JAILBREAK_INDICATORS:
+        if _matches_phrase(user_message, indicator, threshold=0.84):
+            logger.warning(f"Jailbreak attempt detected by indicator: {indicator}")
             return True
 
     return False

@@ -94,7 +94,7 @@
           </div>
         </section>
 
-        <section class="panel__section" ng-if="vm.apiKeyRequired">
+        <section class="panel__section" ng-if="vm.apiKeyRequired && !vm.uiCookieAuthEnabled">
           <div class="panel__heading">API Key</div>
           <label class="field">
             <span class="field__label">X-API-Key</span>
@@ -109,6 +109,13 @@
             />
             <span class="field__help">Printed in server logs at startup, or set via `APP_API_KEY`.</span>
           </label>
+        </section>
+
+        <section class="panel__section" ng-if="vm.apiKeyRequired && vm.uiCookieAuthEnabled">
+          <div class="panel__heading">Authentication</div>
+          <div class="text-muted small">
+            Browser session authentication is active. Manual API key entry is optional.
+          </div>
         </section>
 
         <section class="panel__section">
@@ -239,6 +246,7 @@
             <div class="msg__meta">
               <span class="msg__role">{{ m.role }}</span>
               <span class="msg__time">{{ m.time | date:'shortTime' }}</span>
+              <span class="msg__badge" ng-if="m.backendUsed">{{ m.backendUsed }}</span>
               <span class="msg__badge" ng-if="m.guardrailsTriggered">rails</span>
             </div>
             <div class="bubble">

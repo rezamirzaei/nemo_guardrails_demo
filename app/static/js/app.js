@@ -55,7 +55,7 @@
       if (conversationId) payload.conversation_id = conversationId;
 
       return $http
-        .post(endpoint, payload, { headers: headers, timeout: 60000 })
+        .post(endpoint, payload, { headers: headers, timeout: 180000 })
         .then(function (r) {
           return r.data;
         });
@@ -120,6 +120,7 @@
     vm.sending = false;
 
     vm.apiKeyRequired = true;
+    vm.uiCookieAuthEnabled = false;
     vm.headerName = "X-API-Key";
     vm.apiKey = Storage.get(STORAGE_API_KEY, "");
 
@@ -163,7 +164,7 @@
       vm.clearMessages();
 
       var key = (vm.apiKey || "").trim();
-      if (vm.apiKeyRequired && !key) {
+      if (vm.apiKeyRequired && !key && !vm.uiCookieAuthEnabled) {
         vm.addSystem("New conversation started.");
         focusComposer();
         return;
@@ -227,7 +228,7 @@
       var message = (vm.draft || "").trim();
       if (!message || vm.sending) return;
 
-      if (vm.apiKeyRequired && !(vm.apiKey || "").trim()) {
+      if (vm.apiKeyRequired && !(vm.apiKey || "").trim() && !vm.uiCookieAuthEnabled) {
         vm.connection = { ok: false, message: "Missing API key. Check server logs." };
         vm.addSystem("API key required. Paste it in the panel.");
         return;
@@ -244,14 +245,25 @@
       Api.sendChat(endpoint, message, vm.conversationId, (vm.apiKey || "").trim(), vm.headerName)
         .then(function (data) {
           vm.conversationId = data.conversation_id || vm.conversationId;
+          var backendUsed = (data.backend_used || vm.backend.mode || "").toString().toLowerCase();
 
           vm.messages.push({
             role: "assistant",
             content: data.response || "",
             time: new Date(),
             guardrailsTriggered: !!data.guardrails_triggered,
+            backendUsed: backendUsed,
           });
-          vm.connection = { ok: true, message: "Ready" };
+
+          if (backendUsed === "local_ollama") {
+            vm.connection = { ok: true, message: "Ready (fallback: Local Llama)" };
+          } else if (backendUsed === "guardrails_block") {
+            vm.connection = { ok: true, message: "Blocked by safety rails" };
+          } else if (backendUsed === "mock") {
+            vm.connection = { ok: true, message: "Ready (mock)" };
+          } else {
+            vm.connection = { ok: true, message: "Ready (" + formatBackendMode(backendUsed) + ")" };
+          }
         })
         .catch(function (err) {
           var status = (err && err.status) || 0;
@@ -259,9 +271,16 @@
 
           if (status === 401 || status === 403) {
             vm.connection = { ok: false, message: "Auth failed" };
+            if (vm.uiCookieAuthEnabled && (vm.apiKey || "").trim()) {
+              vm.apiKey = "";
+              vm.persistApiKey();
+            }
             vm.messages.push({
               role: "assistant",
-              content: "Authentication failed. Check your API key.",
+              content:
+                vm.uiCookieAuthEnabled
+                  ? "Authentication failed. Refresh the page to renew UI auth cookie, or paste the key from `cat .app_api_key`."
+                  : "Authentication failed. Use the key printed by start/run scripts (or `cat .app_api_key`).",
               time: new Date(),
               guardrailsTriggered: false,
             });
@@ -340,11 +359,13 @@
       Api.getInfo()
         .then(function (info) {
           vm.apiKeyRequired = !!info.api_key_required;
+          vm.uiCookieAuthEnabled = !!info.ui_cookie_auth_enabled;
           vm.headerName = info.header_name || "X-API-Key";
           applyBackendState(info.llm_backend_mode, info.llm_backend_model);
         })
         .catch(function () {
           vm.apiKeyRequired = true;
+          vm.uiCookieAuthEnabled = false;
         });
 
       Api.getHealth()
@@ -381,6 +402,8 @@
     function formatBackendMode(mode) {
       if (mode === "google_guardrails") return "Gemini + Guardrails";
       if (mode === "local_ollama") return "Local Llama (Ollama)";
+      if (mode === "guardrails_block") return "Safety Block";
+      if (mode === "mock") return "Mock";
       if (mode === "unavailable") return "No Backend";
       return "Unknown Backend";
     }
@@ -394,7 +417,7 @@
       if (!msg || vm.tools.inputBusy) return;
 
       var key = (vm.apiKey || "").trim();
-      if (vm.apiKeyRequired && !key) {
+      if (vm.apiKeyRequired && !key && !vm.uiCookieAuthEnabled) {
         vm.tools.inputResult = { is_safe: false, details: ["API key required"] };
         return;
       }
@@ -421,7 +444,7 @@
       if (!msg || vm.tools.outputBusy) return;
 
       var key = (vm.apiKey || "").trim();
-      if (vm.apiKeyRequired && !key) {
+      if (vm.apiKeyRequired && !key && !vm.uiCookieAuthEnabled) {
         vm.tools.outputResult = { is_safe: false, details: ["API key required"] };
         return;
       }

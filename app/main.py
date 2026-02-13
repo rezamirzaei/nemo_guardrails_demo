@@ -25,7 +25,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -50,6 +50,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = PROJECT_DIR / "config"
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+API_KEY_FILE = PROJECT_DIR / ".app_api_key"
 
 
 def _get_bool_env(name: str, default: bool) -> bool:
@@ -73,9 +74,13 @@ LOCAL_LLM_FALLBACK_ENABLED = _get_bool_env("LOCAL_LLM_FALLBACK_ENABLED", True)
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "llama3.1:8b").strip() or "llama3.1:8b"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
 try:
-    LOCAL_LLM_TIMEOUT_SECONDS = float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "120").strip())
+    LOCAL_LLM_TIMEOUT_SECONDS = float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "90").strip())
 except ValueError:
-    LOCAL_LLM_TIMEOUT_SECONDS = 120.0
+    LOCAL_LLM_TIMEOUT_SECONDS = 90.0
+try:
+    PRIMARY_LLM_TIMEOUT_SECONDS = float(os.getenv("PRIMARY_LLM_TIMEOUT_SECONDS", "20").strip())
+except ValueError:
+    PRIMARY_LLM_TIMEOUT_SECONDS = 20.0
 
 LLM_BACKEND_GOOGLE = "google_guardrails"
 LLM_BACKEND_LOCAL = "local_ollama"
@@ -90,19 +95,52 @@ OUTPUT_REFUSAL_MESSAGE = (
     "Please ask for a safer alternative."
 )
 
+
+def _load_persistent_api_key() -> str:
+    if not API_KEY_FILE.exists():
+        return ""
+    try:
+        return API_KEY_FILE.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.warning(f"Failed to read API key file {API_KEY_FILE}: {exc}")
+        return ""
+
+
+def _store_persistent_api_key(key: str) -> bool:
+    try:
+        API_KEY_FILE.write_text(f"{key}\n", encoding="utf-8")
+        os.chmod(API_KEY_FILE, 0o600)
+        return True
+    except OSError as exc:
+        logger.warning(f"Failed to persist API key to {API_KEY_FILE}: {exc}")
+        return False
+
 # API key configuration.
-# Default: require an API key, and generate a random one if not provided.
+# Default: require an API key.
 API_KEY_ENABLED = _get_bool_env("API_KEY_REQUIRED", True)
 _raw_api_key = os.getenv("APP_API_KEY", "").strip()
 GENERATED_API_KEY = False
+API_KEY_SOURCE = "disabled"
 if API_KEY_ENABLED:
-    if not _raw_api_key or _raw_api_key == "your-app-api-key-here":
-        API_KEY = secrets.token_urlsafe(32)
-        GENERATED_API_KEY = True
-    else:
+    if _raw_api_key and _raw_api_key != "your-app-api-key-here":
         API_KEY = _raw_api_key
+        API_KEY_SOURCE = "env"
+    else:
+        persisted_key = _load_persistent_api_key()
+        if persisted_key:
+            API_KEY = persisted_key
+            API_KEY_SOURCE = "file"
+        else:
+            API_KEY = secrets.token_urlsafe(32)
+            GENERATED_API_KEY = True
+            if _store_persistent_api_key(API_KEY):
+                API_KEY_SOURCE = "generated_file"
+            else:
+                API_KEY_SOURCE = "generated_ephemeral"
 else:
     API_KEY = None
+UI_AUTH_COOKIE_ENABLED = _get_bool_env("UI_AUTH_COOKIE_ENABLED", True)
+UI_AUTH_COOKIE_NAME = os.getenv("UI_AUTH_COOKIE_NAME", "guardrails_ui_api_key").strip() or "guardrails_ui_api_key"
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # Global rails instance
@@ -244,9 +282,55 @@ async def _check_local_llm_reachable() -> bool:
         return False
 
 
+async def _list_ollama_models(client: httpx.AsyncClient | None = None) -> list[str]:
+    async def _fetch(async_client: httpx.AsyncClient) -> list[str]:
+        response = await async_client.get(f"{OLLAMA_BASE_URL}/api/tags")
+        response.raise_for_status()
+        payload = response.json()
+        models = payload.get("models")
+        if not isinstance(models, list):
+            return []
+        names: list[str] = []
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            name = model.get("name")
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+        return names
+
+    try:
+        if client is not None:
+            return await _fetch(client)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as async_client:
+            return await _fetch(async_client)
+    except Exception:
+        return []
+
+
+def _select_best_local_model(available_models: list[str]) -> str | None:
+    if not available_models:
+        return None
+
+    preferred = [
+        LOCAL_LLM_MODEL,
+        "llama3.2:3b",
+        "llama3.1:8b",
+        "llama3.2:1b",
+        "phi3:mini",
+    ]
+    available_lower = {m.lower(): m for m in available_models}
+    for model in preferred:
+        selected = available_lower.get(model.lower())
+        if selected:
+            return selected
+    return available_models[0]
+
+
 async def _generate_with_ollama(messages: list[dict[str, str]]) -> str:
+    model_to_use = LOCAL_LLM_MODEL
     payload: dict[str, Any] = {
-        "model": LOCAL_LLM_MODEL,
+        "model": model_to_use,
         "messages": messages,
         "stream": False,
     }
@@ -256,6 +340,28 @@ async def _generate_with_ollama(messages: list[dict[str, str]]) -> str:
     )
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+        if response.status_code == 404:
+            try:
+                err = str(response.json().get("error", "")).lower()
+            except Exception:
+                err = response.text.lower()
+            if "model" in err and "not found" in err:
+                available_models = await _list_ollama_models(client)
+                fallback_model = _select_best_local_model(available_models)
+                if fallback_model and fallback_model.lower() != model_to_use.lower():
+                    logger.warning(
+                        f"Ollama model '{model_to_use}' not found. "
+                        f"Retrying with '{fallback_model}'."
+                    )
+                    model_to_use = fallback_model
+                    payload["model"] = model_to_use
+                    response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+                else:
+                    available_text = ", ".join(available_models) if available_models else "(none)"
+                    raise ValueError(
+                        f"Ollama model '{LOCAL_LLM_MODEL}' is not available. "
+                        f"Available models: {available_text}."
+                    )
         response.raise_for_status()
 
     body = response.json()
@@ -266,6 +372,51 @@ async def _generate_with_ollama(messages: list[dict[str, str]]) -> str:
         raise ValueError("Local LLM returned an empty response")
 
     return content.strip()
+
+
+async def _generate_with_runtime_failover(messages: list[dict[str, str]]) -> tuple[str, str]:
+    """
+    Generate text using the active backend, with per-request failover to local Ollama.
+
+    This allows automatic fallback when Gemini is unavailable, misconfigured, rate limited,
+    or returns an empty response.
+    """
+    if llm_backend_mode == LLM_BACKEND_GOOGLE and rails is not None:
+        try:
+            response = await asyncio.wait_for(
+                rails.generate_async(messages=messages),
+                timeout=PRIMARY_LLM_TIMEOUT_SECONDS,
+            )
+            response_text = str(response.get("content", "")).strip()
+            if response_text:
+                return response_text, LLM_BACKEND_GOOGLE
+
+            logger.warning(
+                "Gemini/Guardrails backend returned empty content; attempting local Ollama fallback."
+            )
+        except Exception as exc:
+            if not LOCAL_LLM_FALLBACK_ENABLED:
+                raise
+            logger.warning(
+                f"Gemini/Guardrails request failed ({type(exc).__name__}: {exc}); "
+                "attempting local Ollama fallback."
+            )
+
+    if llm_backend_mode == LLM_BACKEND_GOOGLE and rails is None:
+        logger.warning(
+            "Gemini backend mode is active but rails are not initialized; "
+            "attempting local Ollama fallback."
+        )
+
+    if llm_backend_mode == LLM_BACKEND_LOCAL:
+        response_text = await _generate_with_ollama(messages)
+        return response_text, LLM_BACKEND_LOCAL
+
+    if LOCAL_LLM_FALLBACK_ENABLED:
+        response_text = await _generate_with_ollama(messages)
+        return response_text, LLM_BACKEND_LOCAL
+
+    raise HTTPException(status_code=503, detail=_backend_unavailable_detail())
 
 
 async def _run_input_safety(message: str) -> tuple[bool, bool, list[str]]:
@@ -327,6 +478,7 @@ class ChatResponse(BaseModel):
     response: str = Field(..., description="Assistant response")
     conversation_id: Optional[str] = Field(None, description="Conversation ID")
     guardrails_triggered: bool = Field(False, description="Whether any guardrails were triggered")
+    backend_used: str = Field(LLM_BACKEND_UNAVAILABLE, description="Backend used for this response")
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     model_config = {
@@ -335,6 +487,7 @@ class ChatResponse(BaseModel):
                 "response": "Hello! I'm here to help you with various tasks...",
                 "conversation_id": "conv-123",
                 "guardrails_triggered": False,
+                "backend_used": "google_guardrails",
                 "timestamp": "2024-01-15T10:30:00"
             }
         }
@@ -355,6 +508,7 @@ class APIKeyResponse(BaseModel):
     """Response model for API key info"""
     message: str
     api_key_required: bool = True
+    ui_cookie_auth_enabled: bool = False
     header_name: str = "X-API-Key"
     llm_backend_mode: str = LLM_BACKEND_UNAVAILABLE
     llm_backend_model: str = ""
@@ -419,23 +573,37 @@ class ConversationDeleteResponse(BaseModel):
 # Authentication
 # =============================================================================
 
-async def verify_api_key(api_key: Optional[str] = Depends(API_KEY_HEADER)) -> Optional[str]:
+async def verify_api_key(
+    request: Request,
+    api_key: Optional[str] = Depends(API_KEY_HEADER),
+) -> Optional[str]:
     """Verify API key for protected endpoints. If auth is disabled, allow all requests."""
     if not API_KEY_ENABLED:
         return None
 
-    if api_key is None:
-        raise HTTPException(
-            status_code=401,
-            detail="API key is required. Pass it in the X-API-Key header.",
-            headers={"WWW-Authenticate": "ApiKey"}
-        )
-    if api_key != API_KEY:
+    header_key = api_key.strip() if isinstance(api_key, str) and api_key.strip() else None
+    cookie_key = None
+    if UI_AUTH_COOKIE_ENABLED:
+        cookie_value = request.cookies.get(UI_AUTH_COOKIE_NAME, "").strip()
+        if cookie_value:
+            cookie_key = cookie_value
+
+    if header_key and secrets.compare_digest(header_key, API_KEY):
+        return header_key
+    if cookie_key and secrets.compare_digest(cookie_key, API_KEY):
+        return cookie_key
+
+    if header_key or cookie_key:
         raise HTTPException(
             status_code=403,
             detail="Invalid API key"
         )
-    return api_key
+
+    raise HTTPException(
+        status_code=401,
+        detail="API key is required. Pass it in the X-API-Key header.",
+        headers={"WWW-Authenticate": "ApiKey"}
+    )
 
 
 # =============================================================================
@@ -460,11 +628,18 @@ async def lifespan(app: FastAPI):
 
     logger.info("Loading NeMo Guardrails configuration...")
     if API_KEY_ENABLED:
-        if GENERATED_API_KEY:
+        if API_KEY_SOURCE == "env":
+            logger.info("API Key authentication: ENABLED (using APP_API_KEY)")
+        elif API_KEY_SOURCE == "file":
+            logger.info(f"API Key authentication: ENABLED (using persisted key from {API_KEY_FILE})")
+        elif API_KEY_SOURCE == "generated_file":
+            logger.info(f"API Key authentication: ENABLED (generated key: {API_KEY})")
+            logger.info(f"Key persisted at {API_KEY_FILE} for stable restarts.")
+        elif API_KEY_SOURCE == "generated_ephemeral":
             logger.info(f"API Key authentication: ENABLED (generated key: {API_KEY})")
             logger.info("Set APP_API_KEY in .env to keep a stable key across restarts/reloads.")
         else:
-            logger.info("API Key authentication: ENABLED (using APP_API_KEY)")
+            logger.info("API Key authentication: ENABLED")
     else:
         logger.info("API Key authentication: DISABLED (no API key required)")
 
@@ -590,12 +765,23 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # =============================================================================
 
 @app.get("/", include_in_schema=False)
-async def root():
+async def root(request: Request):
     """Serve the main web UI"""
     index_path = STATIC_DIR / "index.html"
     if not index_path.exists():
         raise HTTPException(status_code=500, detail="UI is missing: app/static/index.html")
-    return FileResponse(index_path)
+    response = FileResponse(index_path)
+    if API_KEY_ENABLED and UI_AUTH_COOKIE_ENABLED and API_KEY:
+        response.set_cookie(
+            key=UI_AUTH_COOKIE_NAME,
+            value=API_KEY,
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="lax",
+            max_age=7 * 24 * 60 * 60,
+            path="/",
+        )
+    return response
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
@@ -623,11 +809,16 @@ async def api_info():
     """
     return APIKeyResponse(
         message=(
-            "Use the X-API-Key header to authenticate. Check server logs for the API key."
+            (
+                f"Use the X-API-Key header. Local key is persisted in {API_KEY_FILE} "
+                f"unless APP_API_KEY is set. Browser UI auto-auth is "
+                f"{'enabled' if UI_AUTH_COOKIE_ENABLED else 'disabled'}."
+            )
             if API_KEY_ENABLED
             else "API key authentication is disabled."
         ),
         api_key_required=API_KEY_ENABLED,
+        ui_cookie_auth_enabled=(API_KEY_ENABLED and UI_AUTH_COOKIE_ENABLED),
         header_name="X-API-Key",
         llm_backend_mode=llm_backend_mode,
         llm_backend_model=llm_backend_model,
@@ -731,6 +922,7 @@ async def chat(
         messages = history + [{"role": "user", "content": request.message}]
 
         guardrails_triggered = False
+        backend_used = llm_backend_mode
         try:
             input_is_safe, _, input_details = await _run_input_safety(request.message)
         except Exception as exc:
@@ -744,13 +936,9 @@ async def chat(
             logger.info(
                 f"Input blocked by safety checks (conversation_id={conversation_id}, details={input_details})"
             )
-        elif llm_backend_mode == LLM_BACKEND_GOOGLE and rails is not None:
-            response = await rails.generate_async(messages=messages)
-            response_text = str(response.get("content", "")).strip()
-        elif llm_backend_mode == LLM_BACKEND_LOCAL:
-            response_text = await _generate_with_ollama(messages)
+            backend_used = "guardrails_block"
         else:
-            raise HTTPException(status_code=503, detail=_backend_unavailable_detail())
+            response_text, backend_used = await _generate_with_runtime_failover(messages)
 
         # Run output checks for both primary and fallback generation paths.
         try:
@@ -776,7 +964,7 @@ async def chat(
             guardrails_triggered = True
 
         logger.info(
-            f"Generated response (backend={llm_backend_mode}, "
+            f"Generated response (backend_used={backend_used}, "
             f"guardrails_triggered={guardrails_triggered})"
         )
 
@@ -788,7 +976,8 @@ async def chat(
         return ChatResponse(
             response=response_text,
             conversation_id=conversation_id,
-            guardrails_triggered=guardrails_triggered
+            guardrails_triggered=guardrails_triggered,
+            backend_used=backend_used,
         )
 
     except HTTPException:
@@ -797,20 +986,24 @@ async def chat(
         error_str = str(e)
         logger.error(f"Error generating response: {e}")
 
-        if llm_backend_mode == LLM_BACKEND_LOCAL:
-            if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)):
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Local Llama backend is unavailable. Start Ollama and ensure "
-                        f"model '{LOCAL_LLM_MODEL}' is pulled."
-                    ),
-                )
-            if isinstance(e, httpx.HTTPStatusError):
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Local Llama backend returned HTTP {e.response.status_code}.",
-                )
+        if isinstance(e, ValueError):
+            lowered = error_str.lower()
+            if "ollama model" in lowered or "local llm returned an empty response" in lowered:
+                raise HTTPException(status_code=503, detail=error_str)
+
+        if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Local Llama fallback is unavailable. Start Ollama and ensure "
+                    f"model '{LOCAL_LLM_MODEL}' is pulled."
+                ),
+            )
+        if isinstance(e, httpx.HTTPStatusError):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Local Llama backend returned HTTP {e.response.status_code}.",
+            )
 
         # Handle rate limit errors gracefully
         if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str:
@@ -858,7 +1051,8 @@ async def chat_test(
     return ChatResponse(
         response=response_text,
         conversation_id=conversation_id,
-        guardrails_triggered=False
+        guardrails_triggered=False,
+        backend_used="mock",
     )
 
 

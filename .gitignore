@@ -1,5 +1,6 @@
 # Environment
 .env
+.app_api_key
 .venv/
 venv/
 env/

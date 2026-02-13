@@ -9,6 +9,7 @@ It uses Gemini + NeMo Guardrails when configured, and local Ollama fallback othe
 import os
 import logging
 import json
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -61,9 +62,13 @@ LOCAL_LLM_FALLBACK_ENABLED = _get_bool_env("LOCAL_LLM_FALLBACK_ENABLED", True)
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "llama3.1:8b").strip() or "llama3.1:8b"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
 try:
-    LOCAL_LLM_TIMEOUT_SECONDS = float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "120").strip())
+    LOCAL_LLM_TIMEOUT_SECONDS = float(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "90").strip())
 except ValueError:
-    LOCAL_LLM_TIMEOUT_SECONDS = 120.0
+    LOCAL_LLM_TIMEOUT_SECONDS = 90.0
+try:
+    PRIMARY_LLM_TIMEOUT_SECONDS = float(os.getenv("PRIMARY_LLM_TIMEOUT_SECONDS", "20").strip())
+except ValueError:
+    PRIMARY_LLM_TIMEOUT_SECONDS = 20.0
 
 LLM_BACKEND_GOOGLE = "google_guardrails"
 LLM_BACKEND_LOCAL = "local_ollama"
@@ -91,18 +96,86 @@ def _current_backend() -> tuple[str, str]:
     return LLM_BACKEND_UNAVAILABLE, ""
 
 
+async def _list_ollama_models(client: httpx.AsyncClient | None = None) -> list[str]:
+    async def _fetch(async_client: httpx.AsyncClient) -> list[str]:
+        response = await async_client.get(f"{OLLAMA_BASE_URL}/api/tags")
+        response.raise_for_status()
+        payload = response.json()
+        models = payload.get("models")
+        if not isinstance(models, list):
+            return []
+        names: list[str] = []
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            name = model.get("name")
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+        return names
+
+    try:
+        if client is not None:
+            return await _fetch(client)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as async_client:
+            return await _fetch(async_client)
+    except Exception:
+        return []
+
+
+def _select_best_local_model(available_models: list[str]) -> str | None:
+    if not available_models:
+        return None
+
+    preferred = [
+        LOCAL_LLM_MODEL,
+        "llama3.2:3b",
+        "llama3.1:8b",
+        "llama3.2:1b",
+        "phi3:mini",
+    ]
+    available_lower = {m.lower(): m for m in available_models}
+    for model in preferred:
+        selected = available_lower.get(model.lower())
+        if selected:
+            return selected
+    return available_models[0]
+
+
 async def _generate_with_ollama(messages: list[dict[str, str]]) -> str:
+    model_to_use = LOCAL_LLM_MODEL
     timeout = httpx.Timeout(
         timeout=LOCAL_LLM_TIMEOUT_SECONDS,
         connect=min(10.0, LOCAL_LLM_TIMEOUT_SECONDS),
     )
     payload: dict[str, Any] = {
-        "model": LOCAL_LLM_MODEL,
+        "model": model_to_use,
         "messages": messages,
         "stream": False,
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+        if response.status_code == 404:
+            try:
+                err = str(response.json().get("error", "")).lower()
+            except Exception:
+                err = response.text.lower()
+            if "model" in err and "not found" in err:
+                available_models = await _list_ollama_models(client)
+                fallback_model = _select_best_local_model(available_models)
+                if fallback_model and fallback_model.lower() != model_to_use.lower():
+                    logger.warning(
+                        f"Ollama model '{model_to_use}' not found. "
+                        f"Retrying with '{fallback_model}'."
+                    )
+                    model_to_use = fallback_model
+                    payload["model"] = model_to_use
+                    response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+                else:
+                    available_text = ", ".join(available_models) if available_models else "(none)"
+                    raise ValueError(
+                        f"Ollama model '{LOCAL_LLM_MODEL}' is not available. "
+                        f"Available models: {available_text}."
+                    )
         response.raise_for_status()
     body = response.json()
     message = body.get("message")
@@ -237,11 +310,29 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 response_text = INPUT_REFUSAL_MESSAGE
                 guardrails_triggered = True
             elif active_backend_mode == LLM_BACKEND_GOOGLE:
-                rails_instance = get_rails()
-                response = await rails_instance.generate_async(
-                    messages=[{"role": "user", "content": message}]
-                )
-                response_text = str(response.get("content", "")).strip()
+                try:
+                    rails_instance = get_rails()
+                    response = await asyncio.wait_for(
+                        rails_instance.generate_async(
+                            messages=[{"role": "user", "content": message}]
+                        ),
+                        timeout=PRIMARY_LLM_TIMEOUT_SECONDS,
+                    )
+                    response_text = str(response.get("content", "")).strip()
+                    if not response_text:
+                        raise ValueError("Gemini returned an empty response")
+                except Exception as exc:
+                    if not LOCAL_LLM_FALLBACK_ENABLED:
+                        raise
+                    logger.warning(
+                        f"Gemini request failed in MCP tool ({type(exc).__name__}: {exc}); "
+                        "falling back to local Ollama."
+                    )
+                    response_text = await _generate_with_ollama(
+                        messages=[{"role": "user", "content": message}]
+                    )
+                    active_backend_mode = LLM_BACKEND_LOCAL
+                    active_backend_model = LOCAL_LLM_MODEL
             elif active_backend_mode == LLM_BACKEND_LOCAL:
                 response_text = await _generate_with_ollama(
                     messages=[{"role": "user", "content": message}]

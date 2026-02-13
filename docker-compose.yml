@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   guardrails-app:
     build:
@@ -11,6 +9,13 @@ services:
     environment:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - APP_API_KEY=${APP_API_KEY}
+      - LOCAL_LLM_FALLBACK_ENABLED=${LOCAL_LLM_FALLBACK_ENABLED:-true}
+      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-llama3.2:3b}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - LOCAL_LLM_TIMEOUT_SECONDS=${LOCAL_LLM_TIMEOUT_SECONDS:-90}
+      - PRIMARY_LLM_TIMEOUT_SECONDS=${PRIMARY_LLM_TIMEOUT_SECONDS:-20}
+      - UI_AUTH_COOKIE_ENABLED=${UI_AUTH_COOKIE_ENABLED:-true}
+      - UI_AUTH_COOKIE_NAME=${UI_AUTH_COOKIE_NAME:-guardrails_ui_api_key}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     env_file:
       - .env
@@ -18,7 +23,10 @@ services:
       # Mount config for development (hot reload)
       - ./config:/app/config:ro
       - ./app:/app/app:ro
+      - ./.app_api_key:/app/.app_api_key
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Platform for Mac Intel compatibility
     platform: linux/amd64
 
@@ -26,6 +34,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: guardrails-redis
+    profiles:
+      - cache
     ports:
       - "6379:6379"
     volumes:

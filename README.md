@@ -10,7 +10,7 @@ A production-ready NeMo Guardrails application with Docker support, designed for
 - **💬 Web UI**: AngularJS (MVC-style) chat interface for testing
 - **📚 Swagger/ReDoc**: Full API documentation
 - **🐳 Docker Support**: Easy deployment with Docker Compose
-- **🤖 Dual LLM Backend**: Gemini + Guardrails primary, local Ollama/Llama fallback
+- **🤖 Dual LLM Backend**: Gemini + Guardrails primary, automatic local Ollama/Llama runtime failover
 - **🔌 MCP Support**: Model Context Protocol for Claude Desktop integration
 - **💻 Mac Intel Compatible**: Tested on Intel-based Macs (2019+)
 
@@ -66,14 +66,17 @@ uv run uvicorn app.main:app --reload
 
 **Option C: Using Docker**
 ```bash
-docker-compose up --build
+docker compose up --build guardrails-app
+
+# Optional: include Redis cache service
+docker compose --profile cache up --build
 ```
 
 ### 3. Access the Application
 
-Once running, you'll see an **API key** printed in the console. Copy it!
+Once running, you'll see an **API key** printed in the console. It is also persisted in `.app_api_key` unless `APP_API_KEY` is explicitly set.
 
-- **🌐 Web UI**: http://localhost:8000 (paste the API key here)
+- **🌐 Web UI**: http://localhost:8000 (auto-auth via cookie by default; manual key still supported)
 - **📚 Swagger UI**: http://localhost:8000/docs
 - **📖 ReDoc**: http://localhost:8000/redoc
 - **❤️ Health**: http://localhost:8000/health
@@ -160,7 +163,8 @@ uv run python -m app.mcp_server
 {
   "response": "AI response",
   "conversation_id": "id",
-  "guardrails_triggered": false
+  "guardrails_triggered": false,
+  "backend_used": "google_guardrails"
 }
 ```
 
@@ -193,11 +197,14 @@ async def custom_check(context: dict) -> bool:
 | `GOOGLE_API_KEY` | Google Gemini API key | (optional) |
 | `GOOGLE_MODEL` | Gemini model to use | gemini-2.0-flash-lite |
 | `LOCAL_LLM_FALLBACK_ENABLED` | Enable local Ollama fallback when Gemini is unavailable | true |
-| `LOCAL_LLM_MODEL` | Ollama model name | llama3.1:8b |
+| `LOCAL_LLM_MODEL` | Ollama model name | llama3.2:3b |
 | `OLLAMA_BASE_URL` | Ollama server URL | http://127.0.0.1:11434 |
-| `LOCAL_LLM_TIMEOUT_SECONDS` | Timeout for local LLM calls | 120 |
+| `LOCAL_LLM_TIMEOUT_SECONDS` | Timeout for local LLM calls | 90 |
+| `PRIMARY_LLM_TIMEOUT_SECONDS` | Gemini timeout before failover to local model | 20 |
 | `APP_API_KEY` | API key for REST API auth | (auto-generated if unset) |
 | `API_KEY_REQUIRED` | Require API key auth for `/api/*` | true |
+| `UI_AUTH_COOKIE_ENABLED` | Auto-auth browser UI via HttpOnly cookie | true |
+| `UI_AUTH_COOKIE_NAME` | Cookie name for browser UI auth | guardrails_ui_api_key |
 | `LOG_LEVEL` | Logging level | INFO |
 | `DEBUG` | Enable debug mode | false |
 | `CORS_ORIGINS` | Comma-separated CORS origins (or `*`) | `*` |
@@ -211,7 +218,7 @@ async def custom_check(context: dict) -> bool:
 uv run pytest tests/ -v
 
 # Run tests with Docker
-docker-compose run guardrails-app pytest tests/ -v
+docker compose run guardrails-app pytest tests/ -v
 ```
 
 ## Mac Intel (2019) Notes
@@ -236,14 +243,22 @@ docker-compose up --build
 
 1. **Docker build fails on Mac Intel**
    - Ensure Docker Desktop is updated
-   - Add `platform: linux/amd64` to docker-compose services
+   - Add `platform: linux/amd64` to compose services
 
 2. **Gemini API errors**
    - Verify your `GOOGLE_API_KEY` is valid
    - Check API quota and billing
    - Or use local fallback with Ollama (`LOCAL_LLM_FALLBACK_ENABLED=true`)
+   - If `LOCAL_LLM_MODEL` is missing, the app auto-selects an available local model
+   - In Docker, set `OLLAMA_BASE_URL=http://host.docker.internal:11434`
+   - Reduce `PRIMARY_LLM_TIMEOUT_SECONDS` if fallback takes too long
 
-3. **Guardrails not loading**
+3. **Web UI shows authentication failed**
+   - Refresh `http://localhost:8000` to renew the UI auth cookie
+   - If needed, clear saved browser key and use `cat .app_api_key`
+   - Ensure `API_KEY_REQUIRED` and `UI_AUTH_COOKIE_ENABLED` are set as intended
+
+4. **Guardrails not loading**
    - Verify config files are in the `config/` directory
    - Check for YAML syntax errors
 
@@ -251,10 +266,10 @@ docker-compose up --build
 
 ```bash
 # View container logs
-docker-compose logs -f guardrails-app
+docker compose logs -f guardrails-app
 
 # View specific log level
-LOG_LEVEL=DEBUG docker-compose up
+LOG_LEVEL=DEBUG docker compose up
 ```
 
 ## Production Deployment

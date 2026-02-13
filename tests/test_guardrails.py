@@ -2,6 +2,7 @@
 Test suite for NeMo Guardrails application
 """
 
+import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
@@ -33,6 +34,17 @@ class TestWebUI:
         response = client.get("/")
         assert response.status_code == 200
         assert "ng-app=\"guardrailsApp\"" in response.text
+
+    def test_root_sets_ui_auth_cookie(self):
+        from app import main as app_main
+
+        client = TestClient(app_main.app, raise_server_exceptions=False)
+        response = client.get("/")
+
+        assert response.status_code == 200
+        if app_main.API_KEY_ENABLED and app_main.UI_AUTH_COOKIE_ENABLED:
+            assert app_main.UI_AUTH_COOKIE_NAME in response.cookies
+            assert response.cookies.get(app_main.UI_AUTH_COOKIE_NAME) == app_main.API_KEY
 
 
 class TestChatEndpoint:
@@ -105,6 +117,7 @@ class TestChatBackendFallback:
         data = response.json()
         assert data["guardrails_triggered"] is True
         assert "safety controls" in data["response"]
+        assert data["backend_used"] == "guardrails_block"
 
     def test_chat_uses_local_llama_fallback(self, monkeypatch):
         from app import main as app_main
@@ -126,6 +139,100 @@ class TestChatBackendFallback:
         data = response.json()
         assert data["response"] == "Local fallback response."
         assert data["guardrails_triggered"] is False
+        assert data["backend_used"] == app_main.LLM_BACKEND_LOCAL
+
+    def test_chat_falls_back_when_gemini_runtime_fails(self, monkeypatch):
+        from app import main as app_main
+
+        class FailingRails:
+            async def generate_async(self, messages):
+                _ = messages
+                raise RuntimeError("API_KEY_INVALID")
+
+        async def fake_generate(_messages):
+            return "Recovered via local Ollama."
+
+        monkeypatch.setattr(app_main, "llm_backend_mode", app_main.LLM_BACKEND_GOOGLE)
+        monkeypatch.setattr(app_main, "rails", FailingRails())
+        monkeypatch.setattr(app_main, "LOCAL_LLM_FALLBACK_ENABLED", True)
+        monkeypatch.setattr(app_main, "_generate_with_ollama", fake_generate)
+
+        client = TestClient(app_main.app, raise_server_exceptions=False)
+        headers = {"X-API-Key": app_main.API_KEY}
+        response = client.post("/api/chat", json={"message": "hello"}, headers=headers)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["response"] == "Recovered via local Ollama."
+        assert data["backend_used"] == app_main.LLM_BACKEND_LOCAL
+
+    def test_chat_falls_back_when_gemini_times_out(self, monkeypatch):
+        from app import main as app_main
+
+        class SlowRails:
+            async def generate_async(self, messages):
+                _ = messages
+                await asyncio.sleep(0.05)
+                return {"content": "Late Gemini response"}
+
+        async def fake_generate(_messages):
+            return "Fast local fallback."
+
+        monkeypatch.setattr(app_main, "llm_backend_mode", app_main.LLM_BACKEND_GOOGLE)
+        monkeypatch.setattr(app_main, "rails", SlowRails())
+        monkeypatch.setattr(app_main, "LOCAL_LLM_FALLBACK_ENABLED", True)
+        monkeypatch.setattr(app_main, "PRIMARY_LLM_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(app_main, "_generate_with_ollama", fake_generate)
+
+        client = TestClient(app_main.app, raise_server_exceptions=False)
+        headers = {"X-API-Key": app_main.API_KEY}
+        response = client.post("/api/chat", json={"message": "hello"}, headers=headers)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["response"] == "Fast local fallback."
+        assert data["backend_used"] == app_main.LLM_BACKEND_LOCAL
+
+    def test_chat_uses_cookie_when_header_key_is_stale(self, monkeypatch):
+        from app import main as app_main
+
+        async def fake_generate(_messages):
+            return "Cookie auth recovered request."
+
+        monkeypatch.setattr(app_main, "llm_backend_mode", app_main.LLM_BACKEND_LOCAL)
+        monkeypatch.setattr(app_main, "llm_backend_model", "llama3.2:3b")
+        monkeypatch.setattr(app_main, "rails", None)
+        monkeypatch.setattr(app_main, "_generate_with_ollama", fake_generate)
+
+        client = TestClient(app_main.app, raise_server_exceptions=False)
+        headers = {"X-API-Key": "stale-or-invalid-key"}
+        client.cookies.set(app_main.UI_AUTH_COOKIE_NAME, app_main.API_KEY)
+
+        response = client.post(
+            "/api/chat",
+            json={"message": "hello"},
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["response"] == "Cookie auth recovered request."
+
+
+class TestLocalModelSelection:
+    """Tests for local Ollama model selection logic."""
+
+    def test_select_best_local_model_prefers_known_models(self):
+        from app import main as app_main
+
+        selected = app_main._select_best_local_model(["phi3:mini", "llama3.2:3b"])
+        assert selected == "llama3.2:3b"
+
+    def test_select_best_local_model_falls_back_to_first(self):
+        from app import main as app_main
+
+        selected = app_main._select_best_local_model(["custom-model:latest"])
+        assert selected == "custom-model:latest"
 
 
 class TestToolsEndpoints:

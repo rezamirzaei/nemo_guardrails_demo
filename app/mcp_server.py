@@ -8,6 +8,7 @@ as tools that can be used by MCP-compatible clients like Claude Desktop.
 import os
 import logging
 import json
+from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
@@ -15,7 +16,6 @@ from mcp.server.stdio import stdio_server
 from mcp.types import (
     Tool,
     TextContent,
-    CallToolResult,
 )
 
 from dotenv import load_dotenv
@@ -31,14 +31,31 @@ mcp_server = Server("nemo-guardrails-mcp")
 
 # Global rails instance
 rails: LLMRails | None = None
+model_name: str | None = None
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+CONFIG_DIR = PROJECT_DIR / "config"
 
 
 def get_rails() -> LLMRails:
     """Get or initialize the guardrails instance."""
-    global rails
+    global rails, model_name
     if rails is None:
         logger.info("Loading NeMo Guardrails configuration...")
-        config = RailsConfig.from_path("./config")
+        config = RailsConfig.from_path(str(CONFIG_DIR))
+
+        model_override = os.getenv("GOOGLE_MODEL", "").strip()
+        if model_override:
+            for model in config.models:
+                if getattr(model, "type", None) == "main":
+                    model.model = model_override
+
+        if model_name is None:
+            model_name = next(
+                (m.model for m in config.models if getattr(m, "type", None) == "main"),
+                None,
+            )
+
         rails = LLMRails(config)
         logger.info("NeMo Guardrails loaded successfully!")
     return rails
@@ -160,7 +177,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             config_info = {
                 "model": {
                     "engine": "google_genai",
-                    "model": os.getenv("GOOGLE_MODEL", "gemini-2.5-flash-lite")
+                    "model": model_name or os.getenv("GOOGLE_MODEL", "gemini-2.0-flash-lite")
                 },
                 "rails": {
                     "input": ["self_check_input", "check_jailbreak"],

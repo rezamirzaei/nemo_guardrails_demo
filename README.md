@@ -7,10 +7,10 @@ A production-ready NeMo Guardrails application with Docker support, designed for
 - **🛡️ Input Rails**: Content moderation and jailbreak detection
 - **🔒 Output Rails**: Response validation and fact-checking
 - **🔑 API Key Auth**: Secure REST API with authentication
-- **💬 Web UI**: Interactive chat interface for testing
+- **💬 Web UI**: AngularJS (MVC-style) chat interface for testing
 - **📚 Swagger/ReDoc**: Full API documentation
 - **🐳 Docker Support**: Easy deployment with Docker Compose
-- **🤖 Google Gemini**: Powered by Gemini 1.5 Flash LLM
+- **🤖 Google Gemini**: Powered by Gemini (configurable model)
 - **🔌 MCP Support**: Model Context Protocol for Claude Desktop integration
 - **💻 Mac Intel Compatible**: Tested on Intel-based Macs (2019+)
 
@@ -21,7 +21,8 @@ A production-ready NeMo Guardrails application with Docker support, designed for
 ├── app/
 │   ├── __init__.py
 │   ├── main.py              # FastAPI application with Web UI
-│   └── mcp_server.py        # MCP server for Claude Desktop
+│   ├── mcp_server.py        # MCP server for Claude Desktop
+│   └── static/              # AngularJS UI (index.html, css, js)
 ├── config/
 │   ├── config.yml           # Main guardrails configuration
 │   ├── rails.co             # Colang flows (input/output rails)
@@ -106,6 +107,8 @@ cp mcp_config.json ~/Library/Application\ Support/Claude/claude_desktop_config.j
 
 2. Update the `GOOGLE_API_KEY` in the config or set it as an environment variable.
 
+   If the `--directory` path in `mcp_config.json` doesn't match your local checkout, update it (or use `http://localhost:8000/mcp/info` to get a ready-to-paste config with the correct path).
+
 3. Restart Claude Desktop.
 
 ### Available MCP Tools
@@ -127,8 +130,16 @@ uv run python -m app.mcp_server
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/` | GET | Web UI (AngularJS) |
 | `/health` | GET | Health check endpoint |
+| `/api/info` | GET | API key/authentication info |
 | `/api/chat` | POST | Chat with guardrails protection |
+| `/api/chat/test` | POST | Mock chat (no LLM call) |
+| `/api/tools/check_input_safety` | POST | Lightweight input safety check (no LLM call) |
+| `/api/tools/check_output_safety` | POST | Lightweight output safety check (no LLM call) |
+| `/api/conversations` | POST | Create a new conversation |
+| `/api/conversations/{conversation_id}` | GET | Fetch conversation history |
+| `/api/conversations/{conversation_id}` | DELETE | Delete a conversation |
 | `/mcp/info` | GET | MCP server configuration info |
 | `/docs` | GET | OpenAPI documentation |
 
@@ -178,10 +189,12 @@ async def custom_check(context: dict) -> bool:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `GOOGLE_API_KEY` | Google Gemini API key | (required) |
-| `GOOGLE_MODEL` | Gemini model to use | gemini-1.5-flash |
-| `APP_API_KEY` | API key for REST API auth | (auto-generated) |
+| `GOOGLE_MODEL` | Gemini model to use | gemini-2.0-flash-lite |
+| `APP_API_KEY` | API key for REST API auth | (auto-generated if unset) |
+| `API_KEY_REQUIRED` | Require API key auth for `/api/*` | true |
 | `LOG_LEVEL` | Logging level | INFO |
 | `DEBUG` | Enable debug mode | false |
+| `CORS_ORIGINS` | Comma-separated CORS origins (or `*`) | `*` |
 | `HOST` | Server host | 0.0.0.0 |
 | `PORT` | Server port | 8000 |
 
@@ -219,7 +232,7 @@ docker-compose up --build
    - Ensure Docker Desktop is updated
    - Add `platform: linux/amd64` to docker-compose services
 
-2. **OpenAI API errors**
+2. **Google Gemini API errors**
    - Verify your API key is valid
    - Check API quota and billing
 
@@ -242,7 +255,7 @@ LOG_LEVEL=DEBUG docker-compose up
 For production use:
 
 1. Set `DEBUG=false` in `.env`
-2. Configure proper CORS origins in `app/main.py`
+2. Set `CORS_ORIGINS` to your allowed origins (do not use `*`)
 3. Use secrets management for API keys
 4. Enable Redis for caching (already in docker-compose)
 5. Add monitoring and alerting

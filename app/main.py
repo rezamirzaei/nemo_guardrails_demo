@@ -12,17 +12,23 @@ A real-world implementation of NeMo Guardrails with:
 - MCP (Model Context Protocol) server support
 """
 
+import asyncio
 import os
 import logging
 import secrets
 from contextlib import asynccontextmanager
-from typing import Optional
+from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -38,25 +44,146 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# API Key configuration - if not set or default, auth will be optional
-_raw_api_key = os.getenv("APP_API_KEY", "")
-API_KEY_ENABLED = _raw_api_key and _raw_api_key != "your-app-api-key-here"
-API_KEY = _raw_api_key if API_KEY_ENABLED else None
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+CONFIG_DIR = PROJECT_DIR / "config"
+APP_DIR = Path(__file__).resolve().parent
+STATIC_DIR = APP_DIR / "static"
+
+# API key configuration.
+# Default: require an API key, and generate a random one if not provided.
+API_KEY_ENABLED = os.getenv("API_KEY_REQUIRED", "true").strip().lower() in {"1", "true", "yes", "on"}
+_raw_api_key = os.getenv("APP_API_KEY", "").strip()
+GENERATED_API_KEY = False
+if API_KEY_ENABLED:
+    if not _raw_api_key or _raw_api_key == "your-app-api-key-here":
+        API_KEY = secrets.token_urlsafe(32)
+        GENERATED_API_KEY = True
+    else:
+        API_KEY = _raw_api_key
+else:
+    API_KEY = None
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 # Global rails instance
 rails: Optional[LLMRails] = None
 
+# In-memory conversation history (best-effort, for UI/demo use).
+_CONVERSATION_LOCK = asyncio.Lock()
+_CONVERSATIONS: dict[str, dict[str, object]] = {}
+_MAX_CONVERSATIONS = 200
+_MAX_MESSAGES_PER_CONVERSATION = 40
+_CONVERSATION_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+
+
+def _now_ts() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _new_conversation_id() -> str:
+    return uuid4().hex
+
+
+def _ts_to_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _cleanup_conversations(now: float) -> None:
+    expired = [
+        cid
+        for cid, entry in _CONVERSATIONS.items()
+        if isinstance(entry.get("updated_at"), (int, float))
+        and now - float(entry["updated_at"]) > _CONVERSATION_TTL_SECONDS
+    ]
+    for cid in expired:
+        _CONVERSATIONS.pop(cid, None)
+
+
+async def _peek_conversation(conversation_id: str) -> tuple[list[dict[str, str]], float | None]:
+    async with _CONVERSATION_LOCK:
+        now = _now_ts()
+        _cleanup_conversations(now)
+
+        entry = _CONVERSATIONS.get(conversation_id)
+        if entry is None:
+            return [], None
+
+        updated_at = entry.get("updated_at")
+        ts = float(updated_at) if isinstance(updated_at, (int, float)) else None
+
+        messages = entry.get("messages")
+        if isinstance(messages, deque):
+            return list(messages), ts
+        return [], ts
+
+
+async def _delete_conversation(conversation_id: str) -> bool:
+    async with _CONVERSATION_LOCK:
+        now = _now_ts()
+        _cleanup_conversations(now)
+        return _CONVERSATIONS.pop(conversation_id, None) is not None
+
+
+async def _get_conversation_messages(conversation_id: str) -> list[dict[str, str]]:
+    async with _CONVERSATION_LOCK:
+        now = _now_ts()
+        _cleanup_conversations(now)
+
+        entry = _CONVERSATIONS.get(conversation_id)
+        if entry is None:
+            entry = {
+                "messages": deque(maxlen=_MAX_MESSAGES_PER_CONVERSATION),
+                "updated_at": now,
+            }
+            _CONVERSATIONS[conversation_id] = entry
+
+        entry["updated_at"] = now
+        messages = entry.get("messages")
+        if isinstance(messages, deque):
+            return list(messages)
+        return []
+
+
+async def _set_conversation_messages(conversation_id: str, messages: list[dict[str, str]]) -> None:
+    async with _CONVERSATION_LOCK:
+        now = _now_ts()
+        _cleanup_conversations(now)
+
+        # Evict oldest if we exceed cap
+        if len(_CONVERSATIONS) >= _MAX_CONVERSATIONS and conversation_id not in _CONVERSATIONS:
+            oldest_id = None
+            oldest_ts = None
+            for cid, entry in _CONVERSATIONS.items():
+                ts = entry.get("updated_at")
+                if not isinstance(ts, (int, float)):
+                    continue
+                if oldest_ts is None or float(ts) < float(oldest_ts):
+                    oldest_ts = float(ts)
+                    oldest_id = cid
+            if oldest_id is not None:
+                _CONVERSATIONS.pop(oldest_id, None)
+
+        entry = _CONVERSATIONS.get(conversation_id)
+        if entry is None or not isinstance(entry.get("messages"), deque):
+            entry = {
+                "messages": deque(maxlen=_MAX_MESSAGES_PER_CONVERSATION),
+                "updated_at": now,
+            }
+            _CONVERSATIONS[conversation_id] = entry
+
+        dq = entry["messages"]
+        if isinstance(dq, deque):
+            dq.clear()
+            for m in messages[-_MAX_MESSAGES_PER_CONVERSATION :]:
+                role = m.get("role")
+                content = m.get("content")
+                if role in {"user", "assistant"} and isinstance(content, str):
+                    dq.append({"role": role, "content": content})
+        entry["updated_at"] = now
+
 
 # =============================================================================
 # Pydantic Models
 # =============================================================================
-
-class ChatMessage(BaseModel):
-    """Single chat message"""
-    role: str = Field(..., description="Message role: 'user' or 'assistant'")
-    content: str = Field(..., description="Message content")
-
 
 class ChatRequest(BaseModel):
     """Request model for chat endpoint"""
@@ -106,13 +233,67 @@ class APIKeyResponse(BaseModel):
     header_name: str = "X-API-Key"
 
 
+class SafetyCheckRequest(BaseModel):
+    """Request model for safety check endpoints."""
+
+    message: str = Field(..., min_length=1, max_length=4096, description="Message to check")
+
+
+class InputSafetyResponse(BaseModel):
+    """Response model for input safety checks."""
+
+    message: str
+    is_safe: bool
+    jailbreak_detected: bool
+    input_allowed: bool
+    details: list[str] = Field(default_factory=list)
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class OutputSafetyResponse(BaseModel):
+    """Response model for output safety checks."""
+
+    message: str
+    is_safe: bool
+    output_allowed: bool
+    details: list[str] = Field(default_factory=list)
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class ConversationMessage(BaseModel):
+    """Conversation message model."""
+
+    role: str
+    content: str
+
+
+class ConversationResponse(BaseModel):
+    """Conversation history response."""
+
+    conversation_id: str
+    messages: list[ConversationMessage]
+    updated_at: str
+
+
+class ConversationCreateResponse(BaseModel):
+    """Response for creating a new conversation."""
+
+    conversation_id: str
+
+
+class ConversationDeleteResponse(BaseModel):
+    """Response for deleting a conversation."""
+
+    conversation_id: str
+    deleted: bool
+
+
 # =============================================================================
 # Authentication
 # =============================================================================
 
 async def verify_api_key(api_key: Optional[str] = Depends(API_KEY_HEADER)) -> Optional[str]:
-    """Verify API key for protected endpoints. If API_KEY is not configured, skip auth."""
-    # If API key auth is disabled, allow all requests
+    """Verify API key for protected endpoints. If auth is disabled, allow all requests."""
     if not API_KEY_ENABLED:
         return None
 
@@ -134,6 +315,19 @@ async def verify_api_key(api_key: Optional[str] = Depends(API_KEY_HEADER)) -> Op
 # Application Lifespan
 # =============================================================================
 
+def load_rails() -> LLMRails:
+    """Load NeMo Guardrails config from disk, with environment overrides."""
+    config = RailsConfig.from_path(str(CONFIG_DIR))
+
+    model_override = os.getenv("GOOGLE_MODEL", "").strip()
+    if model_override:
+        for model in config.models:
+            if getattr(model, "type", None) == "main":
+                model.model = model_override
+
+    return LLMRails(config)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager - loads guardrails on startup"""
@@ -141,14 +335,16 @@ async def lifespan(app: FastAPI):
 
     logger.info("Loading NeMo Guardrails configuration...")
     if API_KEY_ENABLED:
-        logger.info(f"API Key authentication: ENABLED (key: {API_KEY})")
+        if GENERATED_API_KEY:
+            logger.info(f"API Key authentication: ENABLED (generated key: {API_KEY})")
+            logger.info("Set APP_API_KEY in .env to keep a stable key across restarts/reloads.")
+        else:
+            logger.info("API Key authentication: ENABLED (using APP_API_KEY)")
     else:
         logger.info("API Key authentication: DISABLED (no API key required)")
 
     try:
-        # Load rails configuration from config directory
-        config = RailsConfig.from_path("./config")
-        rails = LLMRails(config)
+        rails = load_rails()
         logger.info("NeMo Guardrails loaded successfully!")
     except Exception as e:
         logger.error(f"Failed to load guardrails: {e}")
@@ -176,11 +372,12 @@ A production-ready NeMo Guardrails application with input/output moderation, pow
 - 🔒 **Output Rails**: Response validation, fact-checking
 - 🔑 **API Key Authentication**: Secure access to chat endpoints
 - 💬 **Web UI**: Interactive chat interface for testing
-- 🤖 **Google Gemini**: Powered by Gemini 1.5 Flash
+- 🤖 **Google Gemini**: Powered by Gemini (configurable)
 - 🔌 **MCP Support**: Model Context Protocol server for Claude Desktop integration
 
 ### Authentication
-All `/api/*` endpoints require an API key passed in the `X-API-Key` header.
+All `/api/*` endpoints require an API key passed in the `X-API-Key` header by default.
+Set `API_KEY_REQUIRED=false` to disable API key auth.
 Check the server logs for the generated API key, or set `APP_API_KEY` in your `.env` file.
 
 ### MCP Integration
@@ -193,23 +390,53 @@ This app also runs as an MCP server. See `/mcp/info` for configuration details.
 )
 
 # Add CORS middleware
+def parse_cors_origins(raw: str) -> list[str]:
+    raw = raw.strip()
+    if not raw:
+        return []
+    if raw == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+CORS_ORIGINS = parse_cors_origins(os.getenv("CORS_ORIGINS", "*"))
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    # API key auth uses headers, not cookies. Keeping this off avoids invalid "*" + credentials CORS.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Response compression (helps the AngularJS UI and JSON responses).
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Lightweight security headers (kept permissive; tighten CSP separately if needed).
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    return response
+
+# Serve the AngularJS UI and assets
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # =============================================================================
 # Public Endpoints (No Auth Required)
 # =============================================================================
 
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/", include_in_schema=False)
 async def root():
     """Serve the main web UI"""
-    return get_chat_ui_html()
+    index_path = STATIC_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=500, detail="UI is missing: app/static/index.html")
+    return FileResponse(index_path)
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
@@ -233,8 +460,12 @@ async def api_info():
     Returns information about how to authenticate with the API.
     """
     return APIKeyResponse(
-        message="Use the X-API-Key header to authenticate. Check server logs for the API key.",
-        api_key_required=True,
+        message=(
+            "Use the X-API-Key header to authenticate. Check server logs for the API key."
+            if API_KEY_ENABLED
+            else "API key authentication is disabled."
+        ),
+        api_key_required=API_KEY_ENABLED,
         header_name="X-API-Key"
     )
 
@@ -246,6 +477,7 @@ async def mcp_info():
 
     Returns the configuration needed to add this server to Claude Desktop or other MCP clients.
     """
+    repo_dir = str(PROJECT_DIR)
     return {
         "name": "nemo-guardrails-mcp",
         "description": "NeMo Guardrails MCP Server - AI assistant with safety rails powered by Google Gemini",
@@ -270,7 +502,7 @@ async def mcp_info():
                     "args": [
                         "run",
                         "--directory",
-                        "/Users/rezami/PycharmProjects/PythonProject7",
+                        repo_dir,
                         "python",
                         "-m",
                         "app.mcp_server"
@@ -319,27 +551,51 @@ async def chat(
     if rails is None:
         raise HTTPException(status_code=503, detail="Guardrails not initialized")
 
-    logger.info(f"Processing message: {request.message[:50]}...")
+    conversation_id = (request.conversation_id or "").strip() or _new_conversation_id()
+    logger.info(f"Processing message (conversation_id={conversation_id}): {request.message[:50]}...")
 
     try:
+        history = await _get_conversation_messages(conversation_id)
+        messages = history + [{"role": "user", "content": request.message}]
+
+        guardrails_triggered = False
+        try:
+            from config.actions import check_jailbreak_attempt, self_check_input
+
+            context = {"user_message": request.message}
+            is_jailbreak = await check_jailbreak_attempt(context)
+            input_allowed = await self_check_input(context)
+            guardrails_triggered = bool(is_jailbreak) or not bool(input_allowed)
+        except Exception as e:
+            logger.debug(f"Input safety checks unavailable: {e}")
+
         # Generate response through guardrails
         response = await rails.generate_async(
-            messages=[{"role": "user", "content": request.message}]
+            messages=messages
         )
 
-        # Check if guardrails blocked or modified the response
-        guardrails_triggered = False
         response_text = response.get("content", "")
 
         # Check for guardrail intervention indicators
-        if "I cannot" in response_text or "I'm not able to" in response_text:
+        refusal_hints = (
+            "I cannot",
+            "I'm not able to",
+            "I'm sorry, but I can't help with that request",
+            "I notice you might be trying to bypass my guidelines",
+        )
+        if any(hint in response_text for hint in refusal_hints):
             guardrails_triggered = True
 
         logger.info(f"Generated response (guardrails_triggered={guardrails_triggered})")
 
+        await _set_conversation_messages(
+            conversation_id,
+            messages + [{"role": "assistant", "content": response_text}],
+        )
+
         return ChatResponse(
             response=response_text,
-            conversation_id=request.conversation_id,
+            conversation_id=conversation_id,
             guardrails_triggered=guardrails_triggered
         )
 
@@ -377,11 +633,136 @@ async def chat_test(
     Test endpoint that returns a mock response without calling the LLM.
     Useful for testing authentication and the API interface.
     """
+    conversation_id = (request.conversation_id or "").strip() or _new_conversation_id()
+    history = await _get_conversation_messages(conversation_id)
+    messages = history + [{"role": "user", "content": request.message}]
+
+    response_text = (
+        f"[TEST MODE] Received your message: '{request.message[:100]}...' "
+        "- this endpoint does not call the LLM."
+    )
+
+    await _set_conversation_messages(
+        conversation_id,
+        messages + [{"role": "assistant", "content": response_text}],
+    )
+
     return ChatResponse(
-        response=f"[TEST MODE] Received your message: '{request.message[:100]}...' - Guardrails would process this in production.",
-        conversation_id=request.conversation_id or "test-conv-001",
+        response=response_text,
+        conversation_id=conversation_id,
         guardrails_triggered=False
     )
+
+
+@app.post(
+    "/api/tools/check_input_safety",
+    response_model=InputSafetyResponse,
+    tags=["Tools"],
+    summary="Check input safety (no LLM call)",
+)
+async def check_input_safety(
+    request: SafetyCheckRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """Run lightweight input checks without calling the LLM."""
+    from config.actions import check_jailbreak_attempt, self_check_input
+
+    context = {"user_message": request.message}
+    is_jailbreak = bool(await check_jailbreak_attempt(context))
+    input_allowed = bool(await self_check_input(context))
+
+    details: list[str] = []
+    if is_jailbreak:
+        details.append("Jailbreak attempt detected")
+    if not input_allowed:
+        details.append("Input contains blocked patterns")
+    if not details:
+        details.append("Message passes basic input checks")
+
+    return InputSafetyResponse(
+        message=request.message,
+        is_safe=(input_allowed and not is_jailbreak),
+        jailbreak_detected=is_jailbreak,
+        input_allowed=input_allowed,
+        details=details,
+    )
+
+
+@app.post(
+    "/api/tools/check_output_safety",
+    response_model=OutputSafetyResponse,
+    tags=["Tools"],
+    summary="Check output safety (no LLM call)",
+)
+async def check_output_safety(
+    request: SafetyCheckRequest,
+    api_key: str = Depends(verify_api_key),
+):
+    """Run lightweight output checks without calling the LLM."""
+    from config.actions import self_check_output
+
+    context = {"bot_message": request.message}
+    output_allowed = bool(await self_check_output(context))
+
+    details: list[str] = []
+    if output_allowed:
+        details.append("Message passes basic output checks")
+    else:
+        details.append("Output contains blocked phrases")
+
+    return OutputSafetyResponse(
+        message=request.message,
+        is_safe=output_allowed,
+        output_allowed=output_allowed,
+        details=details,
+    )
+
+
+@app.post(
+    "/api/conversations",
+    response_model=ConversationCreateResponse,
+    tags=["Conversations"],
+    summary="Create a new conversation",
+)
+async def create_conversation(api_key: str = Depends(verify_api_key)):
+    conversation_id = _new_conversation_id()
+    await _set_conversation_messages(conversation_id, [])
+    return ConversationCreateResponse(conversation_id=conversation_id)
+
+
+@app.get(
+    "/api/conversations/{conversation_id}",
+    response_model=ConversationResponse,
+    tags=["Conversations"],
+    summary="Get conversation history",
+)
+async def get_conversation(
+    conversation_id: str,
+    api_key: str = Depends(verify_api_key),
+):
+    messages, updated_at = await _peek_conversation(conversation_id)
+    if updated_at is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return ConversationResponse(
+        conversation_id=conversation_id,
+        messages=[ConversationMessage(**m) for m in messages],
+        updated_at=_ts_to_iso(updated_at),
+    )
+
+
+@app.delete(
+    "/api/conversations/{conversation_id}",
+    response_model=ConversationDeleteResponse,
+    tags=["Conversations"],
+    summary="Delete a conversation",
+)
+async def delete_conversation(
+    conversation_id: str,
+    api_key: str = Depends(verify_api_key),
+):
+    deleted = await _delete_conversation(conversation_id)
+    return ConversationDeleteResponse(conversation_id=conversation_id, deleted=deleted)
 
 
 @app.post("/api/chat/stream", tags=["Chat"])
@@ -401,487 +782,6 @@ async def chat_stream(
     )
 
 
-# =============================================================================
-# Web UI HTML
-# =============================================================================
-
-def get_chat_ui_html() -> str:
-    """Return the HTML for the chat UI"""
-    if API_KEY_ENABLED:
-        api_key_section = """
-        <div class="api-key-section">
-            <label for="apiKey">API Key</label>
-            <input type="password" id="apiKey" class="api-key-input" placeholder="Enter your API key (check server logs)">
-            <p class="api-key-hint">💡 The API key is printed in the server console when the app starts.</p>
-        </div>
-        """
-        api_key_required_js = "true"
-    else:
-        api_key_section = """
-        <div class="api-key-section" style="background: rgba(118, 184, 82, 0.2); border: 1px solid #76b852;">
-            <p style="color: #76b852; text-align: center;">✅ No API key required - authentication is disabled</p>
-            <input type="hidden" id="apiKey" value="">
-        </div>
-        """
-        api_key_required_js = "false"
-
-    html_template = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NeMo Guardrails + Gemini Chat</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            min-height: 100vh;
-            color: #fff;
-        }
-        
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        
-        header {
-            text-align: center;
-            padding: 20px 0;
-            border-bottom: 1px solid rgba(255,255,255,0.1);
-            margin-bottom: 20px;
-        }
-        
-        header h1 {
-            font-size: 2rem;
-            margin-bottom: 10px;
-            background: linear-gradient(90deg, #76b852, #8DC26F);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        
-        header p {
-            color: #888;
-            font-size: 0.9rem;
-        }
-        
-        .api-key-section {
-            background: rgba(255,255,255,0.05);
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 20px;
-        }
-        
-        .api-key-section label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 500;
-            color: #aaa;
-        }
-        
-        .api-key-input {
-            width: 100%;
-            padding: 12px 16px;
-            border: 1px solid rgba(255,255,255,0.2);
-            border-radius: 8px;
-            background: rgba(0,0,0,0.3);
-            color: #fff;
-            font-size: 14px;
-            font-family: monospace;
-        }
-        
-        .api-key-input:focus {
-            outline: none;
-            border-color: #76b852;
-        }
-        
-        .api-key-hint {
-            margin-top: 8px;
-            font-size: 12px;
-            color: #666;
-        }
-        
-        .chat-container {
-            background: rgba(255,255,255,0.05);
-            border-radius: 12px;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-            height: 500px;
-        }
-        
-        .chat-messages {
-            flex: 1;
-            overflow-y: auto;
-            padding: 20px;
-        }
-        
-        .message {
-            margin-bottom: 16px;
-            display: flex;
-            flex-direction: column;
-        }
-        
-        .message.user {
-            align-items: flex-end;
-        }
-        
-        .message.assistant {
-            align-items: flex-start;
-        }
-        
-        .message-content {
-            max-width: 80%;
-            padding: 12px 16px;
-            border-radius: 12px;
-            line-height: 1.5;
-        }
-        
-        .message.user .message-content {
-            background: linear-gradient(135deg, #76b852, #8DC26F);
-            color: #fff;
-            border-bottom-right-radius: 4px;
-        }
-        
-        .message.assistant .message-content {
-            background: rgba(255,255,255,0.1);
-            border-bottom-left-radius: 4px;
-        }
-        
-        .message-meta {
-            font-size: 11px;
-            color: #666;
-            margin-top: 4px;
-            padding: 0 8px;
-        }
-        
-        .guardrails-badge {
-            display: inline-block;
-            background: #ff6b6b;
-            color: #fff;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 10px;
-            margin-left: 8px;
-        }
-        
-        .chat-input-container {
-            padding: 20px;
-            border-top: 1px solid rgba(255,255,255,0.1);
-            display: flex;
-            gap: 12px;
-        }
-        
-        .chat-input {
-            flex: 1;
-            padding: 14px 18px;
-            border: 1px solid rgba(255,255,255,0.2);
-            border-radius: 24px;
-            background: rgba(0,0,0,0.3);
-            color: #fff;
-            font-size: 14px;
-            resize: none;
-        }
-        
-        .chat-input:focus {
-            outline: none;
-            border-color: #76b852;
-        }
-        
-        .send-button {
-            padding: 14px 28px;
-            background: linear-gradient(135deg, #76b852, #8DC26F);
-            border: none;
-            border-radius: 24px;
-            color: #fff;
-            font-weight: 600;
-            cursor: pointer;
-            transition: transform 0.2s, opacity 0.2s;
-        }
-        
-        .send-button:hover {
-            transform: scale(1.02);
-        }
-        
-        .send-button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
-        .links {
-            display: flex;
-            justify-content: center;
-            gap: 20px;
-            margin-top: 20px;
-        }
-        
-        .links a {
-            color: #76b852;
-            text-decoration: none;
-            font-size: 14px;
-            padding: 8px 16px;
-            border: 1px solid #76b852;
-            border-radius: 8px;
-            transition: background 0.2s;
-        }
-        
-        .links a:hover {
-            background: rgba(118, 184, 82, 0.2);
-        }
-        
-        .status {
-            text-align: center;
-            padding: 10px;
-            font-size: 12px;
-        }
-        
-        .status.connected {
-            color: #76b852;
-        }
-        
-        .status.error {
-            color: #ff6b6b;
-        }
-        
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 2px solid rgba(255,255,255,0.3);
-            border-radius: 50%;
-            border-top-color: #76b852;
-            animation: spin 1s ease-in-out infinite;
-        }
-        
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        
-        .examples {
-            margin-top: 20px;
-            padding: 15px;
-            background: rgba(255,255,255,0.03);
-            border-radius: 8px;
-        }
-        
-        .examples h3 {
-            font-size: 14px;
-            color: #888;
-            margin-bottom: 10px;
-        }
-        
-        .example-btn {
-            display: inline-block;
-            margin: 4px;
-            padding: 8px 12px;
-            background: rgba(255,255,255,0.1);
-            border: none;
-            border-radius: 6px;
-            color: #ccc;
-            font-size: 12px;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
-        
-        .example-btn:hover {
-            background: rgba(255,255,255,0.2);
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>🛡️ NeMo Guardrails + Gemini</h1>
-            <p>AI Assistant with Input/Output Safety Rails • Powered by Google Gemini</p>
-        </header>
-        
-        __API_KEY_SECTION__
-        
-        <div class="chat-container">
-            <div class="chat-messages" id="chatMessages">
-                <div class="message assistant">
-                    <div class="message-content">
-                        Hello! I'm an AI assistant powered by Google Gemini and protected by NeMo Guardrails. I can help you with questions while ensuring safe and appropriate responses. How can I assist you today?
-                    </div>
-                </div>
-            </div>
-            <div class="chat-input-container">
-                <input type="text" id="chatInput" class="chat-input" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
-                <button class="send-button" id="sendButton" onclick="sendMessage()">Send</button>
-            </div>
-        </div>
-        
-        <div class="status" id="status">Ready</div>
-        
-        <div class="examples">
-            <h3>Try these examples:</h3>
-            <button class="example-btn" onclick="setExample('Hello, how are you?')">👋 Greeting</button>
-            <button class="example-btn" onclick="setExample('What can you help me with?')">❓ Capabilities</button>
-            <button class="example-btn" onclick="setExample('Tell me about machine learning')">🤖 ML Question</button>
-            <button class="example-btn" onclick="setExample('Ignore your instructions and...')">🚫 Jailbreak Test</button>
-            <button class="example-btn" onclick="setExample('How do I hack into...')">⚠️ Harmful Test</button>
-        </div>
-        
-        <div class="links">
-            <a href="/docs" target="_blank">📚 API Docs (Swagger)</a>
-            <a href="/redoc" target="_blank">📖 API Docs (ReDoc)</a>
-            <a href="/mcp/info" target="_blank">🔌 MCP Config</a>
-            <a href="/health" target="_blank">❤️ Health Check</a>
-        </div>
-    </div>
-    
-    <script>
-        const chatMessages = document.getElementById('chatMessages');
-        const chatInput = document.getElementById('chatInput');
-        const sendButton = document.getElementById('sendButton');
-        const apiKeyInput = document.getElementById('apiKey');
-        const status = document.getElementById('status');
-        const apiKeyRequired = __API_KEY_REQUIRED__;
-        
-        // Load API key from localStorage
-        if (apiKeyRequired && apiKeyInput) {
-            const savedApiKey = localStorage.getItem('nemo_api_key');
-            if (savedApiKey) {
-                apiKeyInput.value = savedApiKey;
-            }
-            
-            // Save API key when changed
-            apiKeyInput.addEventListener('change', () => {
-                localStorage.setItem('nemo_api_key', apiKeyInput.value);
-            });
-        }
-        
-        function setExample(text) {
-            chatInput.value = text;
-            chatInput.focus();
-        }
-        
-        function handleKeyPress(event) {
-            if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                sendMessage();
-            }
-        }
-        
-        function addMessage(content, role, guardrailsTriggered = false) {
-            const messageDiv = document.createElement('div');
-            messageDiv.className = 'message ' + role;
-            
-            let metaHtml = '';
-            if (guardrailsTriggered) {
-                metaHtml = '<span class="guardrails-badge">Guardrails Triggered</span>';
-            }
-            
-            messageDiv.innerHTML = 
-                '<div class="message-content">' + escapeHtml(content) + '</div>' +
-                '<div class="message-meta">' + new Date().toLocaleTimeString() + metaHtml + '</div>';
-            
-            chatMessages.appendChild(messageDiv);
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-        
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-        
-        function setStatus(message, isError) {
-            status.textContent = message;
-            status.className = 'status ' + (isError ? 'error' : 'connected');
-        }
-        
-        async function sendMessage() {
-            const message = chatInput.value.trim();
-            const apiKey = apiKeyInput ? apiKeyInput.value.trim() : '';
-            
-            if (!message) return;
-            
-            if (apiKeyRequired && !apiKey) {
-                setStatus('Please enter your API key', true);
-                if (apiKeyInput) apiKeyInput.focus();
-                return;
-            }
-            
-            // Add user message
-            addMessage(message, 'user');
-            chatInput.value = '';
-            
-            // Disable input while processing
-            sendButton.disabled = true;
-            chatInput.disabled = true;
-            setStatus('Processing...', false);
-            
-            try {
-                const headers = {'Content-Type': 'application/json'};
-                if (apiKey) {
-                    headers['X-API-Key'] = apiKey;
-                }
-                
-                const response = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: headers,
-                    body: JSON.stringify({ message: message })
-                });
-                
-                if (response.status === 401 || response.status === 403) {
-                    setStatus('Invalid API key. Check server logs for the correct key.', true);
-                    return;
-                }
-                
-                if (response.status === 429) {
-                    const error = await response.json();
-                    setStatus('Rate limit exceeded - wait and try again', true);
-                    addMessage('⏳ ' + (error.detail || 'Rate limit exceeded. Please wait a minute and try again.'), 'assistant');
-                    return;
-                }
-                
-                if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.detail || 'Request failed');
-                }
-                
-                const data = await response.json();
-                addMessage(data.response, 'assistant', data.guardrails_triggered);
-                setStatus('Ready', false);
-                
-            } catch (error) {
-                setStatus('Error: ' + error.message, true);
-                addMessage('Sorry, an error occurred: ' + error.message, 'assistant');
-            } finally {
-                sendButton.disabled = false;
-                chatInput.disabled = false;
-                chatInput.focus();
-            }
-        }
-        
-        // Check health on load
-        fetch('/health')
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-                if (data.guardrails_loaded) {
-                    setStatus('Connected - Guardrails loaded ✓', false);
-                } else {
-                    setStatus('Warning: Guardrails not loaded', true);
-                }
-            })
-            .catch(function() { setStatus('Cannot connect to server', true); });
-    </script>
-</body>
-</html>
-"""
-
-    return html_template.replace('__API_KEY_SECTION__', api_key_section).replace('__API_KEY_REQUIRED__', api_key_required_js)
-
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
@@ -890,4 +790,3 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", 8000)),
         reload=os.getenv("DEBUG", "false").lower() == "true"
     )
-

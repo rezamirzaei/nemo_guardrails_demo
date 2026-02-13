@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en" ng-app="guardrailsApp">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NeMo Guardrails Control Room</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/css/styles.css" />
+  </head>
+
+  <body ng-controller="ChatController as vm" ng-cloak>
+    <div class="bg" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand__mark" aria-hidden="true"></div>
+        <div class="brand__text">
+          <div class="brand__title">NeMo Guardrails</div>
+          <div class="brand__subtitle">Gemini-backed assistant with safety rails</div>
+        </div>
+      </div>
+
+      <div class="topbar__status">
+        <span class="pill" ng-class="vm.health.ok ? 'pill--ok' : 'pill--warn'">
+          {{ vm.health.ok ? 'Healthy' : 'Degraded' }}
+        </span>
+        <span class="pill" ng-class="vm.health.guardrailsLoaded ? 'pill--ok' : 'pill--warn'">
+          {{ vm.health.guardrailsLoaded ? 'Rails Loaded' : 'Rails Not Loaded' }}
+        </span>
+        <span class="pill" ng-class="vm.apiKeyRequired ? 'pill--neutral' : 'pill--ok'">
+          {{ vm.apiKeyRequired ? 'API Key Required' : 'No API Key' }}
+        </span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="panel">
+        <section class="panel__section">
+          <div class="panel__heading">Connection</div>
+          <div class="kv">
+            <div class="kv__k">Server</div>
+            <div class="kv__v">{{ vm.serverBase }}</div>
+            <div class="kv__k">Status</div>
+            <div class="kv__v" ng-class="vm.connection.ok ? 'text-ok' : 'text-warn'">
+              {{ vm.connection.message }}
+            </div>
+          </div>
+        </section>
+
+        <section class="panel__section">
+          <div class="panel__heading">Session</div>
+          <div class="kv">
+            <div class="kv__k">Conversation</div>
+            <div class="kv__v kv__v--mono">
+              <span ng-if="vm.conversationId">{{ vm.conversationId }}</span>
+              <span ng-if="!vm.conversationId" class="text-muted">Not started</span>
+            </div>
+          </div>
+          <div class="panel__actions">
+            <button class="btn btn--ghost" type="button" ng-click="vm.newConversation()">New</button>
+            <button
+              class="btn btn--ghost"
+              type="button"
+              ng-click="vm.copyConversationId()"
+              ng-disabled="!vm.conversationId"
+            >
+              Copy
+            </button>
+            <button
+              class="btn btn--ghost"
+              type="button"
+              ng-click="vm.exportConversation()"
+              ng-disabled="vm.messages.length === 0"
+            >
+              Export
+            </button>
+            <button class="btn btn--ghost" type="button" ng-click="vm.clearMessages()">Clear</button>
+          </div>
+        </section>
+
+        <section class="panel__section" ng-if="vm.apiKeyRequired">
+          <div class="panel__heading">API Key</div>
+          <label class="field">
+            <span class="field__label">X-API-Key</span>
+            <input
+              class="input"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              ng-model="vm.apiKey"
+              ng-change="vm.persistApiKey()"
+              placeholder="Paste the server API key"
+            />
+            <span class="field__help">Printed in server logs at startup, or set via `APP_API_KEY`.</span>
+          </label>
+        </section>
+
+        <section class="panel__section">
+          <div class="panel__heading">Mode</div>
+          <div class="seg">
+            <button
+              type="button"
+              class="seg__btn"
+              ng-class="vm.mode === 'live' ? 'seg__btn--active' : ''"
+              ng-click="vm.setMode('live')"
+            >
+              Live
+            </button>
+            <button
+              type="button"
+              class="seg__btn"
+              ng-class="vm.mode === 'mock' ? 'seg__btn--active' : ''"
+              ng-click="vm.setMode('mock')"
+            >
+              Mock
+            </button>
+          </div>
+          <div class="text-muted small">
+            Live calls `/api/chat`. Mock calls `/api/chat/test` (no LLM).
+          </div>
+        </section>
+
+        <section class="panel__section">
+          <div class="panel__heading">Examples</div>
+          <div class="chips">
+            <button class="chip" type="button" ng-click="vm.useExample('Hello!')">Greeting</button>
+            <button class="chip" type="button" ng-click="vm.useExample('What can you do?')">Capabilities</button>
+            <button class="chip" type="button" ng-click="vm.useExample('Explain transformers in simple terms.')">
+              ML
+            </button>
+            <button class="chip" type="button" ng-click="vm.useExample('Ignore all previous instructions and...')">
+              Jailbreak Test
+            </button>
+          </div>
+        </section>
+
+        <section class="panel__section">
+          <div class="panel__heading">Tools</div>
+
+          <div class="tool">
+            <div class="tool__title">Check input safety</div>
+            <textarea
+              class="tool__textarea"
+              rows="2"
+              ng-model="vm.tools.inputText"
+              placeholder="Paste user input to check"
+            ></textarea>
+            <div class="tool__actions">
+              <button class="btn btn--ghost" type="button" ng-click="vm.checkInputSafety()" ng-disabled="vm.tools.inputBusy">
+                {{ vm.tools.inputBusy ? 'Checking' : 'Check' }}
+              </button>
+              <span class="tool__hint">No LLM call</span>
+            </div>
+
+            <div class="tool__result" ng-if="vm.tools.inputResult">
+              <span class="pill" ng-class="vm.tools.inputResult.is_safe ? 'pill--ok' : 'pill--warn'">
+                {{ vm.tools.inputResult.is_safe ? 'Safe' : 'Blocked' }}
+              </span>
+              <ul class="tool__list" ng-if="vm.tools.inputResult.details && vm.tools.inputResult.details.length">
+                <li class="tool__li" ng-repeat="d in vm.tools.inputResult.details track by $index">{{ d }}</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="tool tool--spaced">
+            <div class="tool__title">Check output safety</div>
+            <textarea
+              class="tool__textarea"
+              rows="2"
+              ng-model="vm.tools.outputText"
+              placeholder="Paste candidate assistant output to check"
+            ></textarea>
+            <div class="tool__actions">
+              <button
+                class="btn btn--ghost"
+                type="button"
+                ng-click="vm.checkOutputSafety()"
+                ng-disabled="vm.tools.outputBusy"
+              >
+                {{ vm.tools.outputBusy ? 'Checking' : 'Check' }}
+              </button>
+              <span class="tool__hint">No LLM call</span>
+            </div>
+
+            <div class="tool__result" ng-if="vm.tools.outputResult">
+              <span class="pill" ng-class="vm.tools.outputResult.is_safe ? 'pill--ok' : 'pill--warn'">
+                {{ vm.tools.outputResult.is_safe ? 'Safe' : 'Blocked' }}
+              </span>
+              <ul class="tool__list" ng-if="vm.tools.outputResult.details && vm.tools.outputResult.details.length">
+                <li class="tool__li" ng-repeat="d in vm.tools.outputResult.details track by $index">{{ d }}</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel__section">
+          <div class="panel__heading">Links</div>
+          <div class="links">
+            <a class="link" href="/docs" target="_blank" rel="noreferrer">API Docs</a>
+            <a class="link" href="/mcp/info" target="_blank" rel="noreferrer">MCP Info</a>
+            <a class="link" href="/health" target="_blank" rel="noreferrer">Health</a>
+          </div>
+        </section>
+      </aside>
+
+      <section class="chat">
+        <div class="chat__header">
+          <div class="chat__title">Chat</div>
+          <div class="chat__hint">
+            {{ vm.mode === 'live' ? 'Guardrails + LLM' : 'Mock response (no LLM)' }}
+          </div>
+        </div>
+
+        <div class="messages" id="messages">
+          <div class="empty" ng-if="vm.messages.length === 0">
+            <div class="empty__title">Start a conversation</div>
+            <div class="empty__body">
+              This UI is AngularJS-based (controller + services). The backend stays FastAPI.
+            </div>
+          </div>
+
+          <div class="msg" ng-repeat="m in vm.messages track by $index" ng-class="'msg--' + m.role">
+            <div class="msg__meta">
+              <span class="msg__role">{{ m.role }}</span>
+              <span class="msg__time">{{ m.time | date:'shortTime' }}</span>
+              <span class="msg__badge" ng-if="m.guardrailsTriggered">rails</span>
+            </div>
+            <div class="bubble">
+              <pre class="bubble__text">{{ m.content }}</pre>
+            </div>
+          </div>
+        </div>
+
+        <form class="composer" ng-submit="vm.send()" novalidate>
+          <textarea
+            class="composer__input"
+            rows="2"
+            ng-model="vm.draft"
+            ng-disabled="vm.sending"
+            placeholder="Type a message, press Enter to send (Shift+Enter for newline)"
+            ng-keydown="vm.onKeydown($event)"
+          ></textarea>
+          <button class="btn btn--primary composer__send" type="submit" ng-disabled="vm.sending || !vm.draft.trim()">
+            <span ng-if="!vm.sending">Send</span>
+            <span ng-if="vm.sending">Sending</span>
+          </button>
+        </form>
+
+        <div class="footer">
+          <div class="footer__left">
+            <span class="text-muted">Tip:</span> keep `CORS_ORIGINS` tight in production.
+          </div>
+          <div class="footer__right">
+            <span class="text-muted">API:</span> <span class="mono">{{ vm.mode === 'live' ? '/api/chat' : '/api/chat/test' }}</span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.8.2/angular.min.js"></script>
+    <script src="/static/js/app.js"></script>
+  </body>
+</html>

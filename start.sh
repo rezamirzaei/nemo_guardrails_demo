@@ -1,7 +1,10 @@
 #!/bin/bash
 # Quick setup and run script
 
-cd /Users/rezami/PycharmProjects/PythonProject7
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 # Create .env if it doesn't exist
 if [ ! -f .env ]; then
@@ -13,7 +16,7 @@ fi
 if grep -q "your-gemini-api-key-here" .env 2>/dev/null; then
     echo ""
     echo "⚠️  IMPORTANT: You need to set your GOOGLE_API_KEY in .env"
-    echo "   Edit the file: /Users/rezami/PycharmProjects/PythonProject7/.env"
+    echo "   Edit the file: .env"
     echo "   Get your key from: https://makersuite.google.com/app/apikey"
     echo ""
 fi

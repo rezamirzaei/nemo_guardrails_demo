@@ -11,7 +11,7 @@
         "app.mcp_server"
       ],
       "env": {
-        "GOOGLE_API_KEY": "${GOOGLE_API_KEY}"
+        "GOOGLE_API_KEY": "your-gemini-api-key-here"
       }
     }
   }

@@ -5,6 +5,7 @@ Run this to troubleshoot API issues.
 """
 import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -34,9 +35,9 @@ def test_direct_api():
             if 'generateContent' in model.supported_generation_methods:
                 print(f"  - {model.name}")
 
-        # Test with gemini-2.0-flash-lite (available model)
-        print("\n💬 Testing gemini-2.0-flash-lite...")
-        model = genai.GenerativeModel('gemini-2.0-flash-lite')
+        model_name = os.getenv("GOOGLE_MODEL", "gemini-2.0-flash-lite")
+        print(f"\n💬 Testing {model_name}...")
+        model = genai.GenerativeModel(model_name)
         response = model.generate_content("Say 'Hello from Gemini!' in exactly 5 words")
         print(f"✅ Response: {response.text}")
         return True
@@ -51,8 +52,16 @@ def test_nemo_guardrails():
     try:
         from nemoguardrails import RailsConfig, LLMRails
 
-        print("  Loading config from ./config ...")
-        config = RailsConfig.from_path("./config")
+        config_dir = Path(__file__).resolve().parent / "config"
+        print(f"  Loading config from {config_dir} ...")
+        config = RailsConfig.from_path(str(config_dir))
+
+        model_override = os.getenv("GOOGLE_MODEL", "").strip()
+        if model_override:
+            for model in config.models:
+                if getattr(model, "type", None) == "main":
+                    model.model = model_override
+
         print("  Creating LLMRails instance...")
         rails = LLMRails(config)
         print("  ✅ Guardrails loaded successfully!")
